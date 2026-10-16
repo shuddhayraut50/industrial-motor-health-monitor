@@ -110,12 +110,14 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Restrict HTTP methods
+// Diagnostic endpoint check
 export async function GET() {
-  return NextResponse.json(
-    { error: 'Method Not Allowed', message: 'Use POST to submit device telemetry' },
-    { status: 405 }
-  );
+  return NextResponse.json({
+    status: 'online',
+    service: 'industrial-motor-health-monitor',
+    endpoint: '/api/telemetry',
+    instruction: 'Send telemetry summaries via HTTP POST with header x-device-token',
+  });
 }
 
 export async function OPTIONS() {
