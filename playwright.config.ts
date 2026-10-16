@@ -1,7 +1,26 @@
 import { defineConfig, devices } from '@playwright/test';
-import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
-dotenv.config({ path: '.env.local' });
+// Parse .env.local without requiring external dotenv package
+try {
+  const envPath = path.resolve(process.cwd(), '.env.local');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+    for (const line of lines) {
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+      if (match && !process.env[match[1]]) {
+        let value = (match[2] || '').trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        process.env[match[1]] = value;
+      }
+    }
+  }
+} catch {
+  // Ignore in production environments where env vars are already populated
+}
 
 export default defineConfig({
   testDir: './tests/e2e',
