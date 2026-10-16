@@ -22,11 +22,21 @@ export default function HistoryPage() {
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 15;
 
+  const getFilterDates = useCallback(() => {
+    const now = new Date();
+    const startIso = startDate
+      ? new Date(startDate).toISOString()
+      : new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+    const endIso = endDate
+      ? new Date(endDate).toISOString()
+      : now.toISOString();
+    return { startIso, endIso };
+  }, [startDate, endDate]);
+
   const fetchHistory = useCallback(async () => {
     setIsLoading(true);
     try {
-      const startIso = startDate ? new Date(startDate).toISOString() : '';
-      const endIso = endDate ? new Date(endDate).toISOString() : '';
+      const { startIso, endIso } = getFilterDates();
       const res = await fetch(
         `/api/telemetry/history?device_id=${encodeURIComponent(deviceId)}&start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}&limit=1000`,
         { cache: 'no-store' }
@@ -42,24 +52,13 @@ export default function HistoryPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [deviceId, startDate, endDate]);
+  }, [deviceId, getFilterDates]);
 
   useEffect(() => {
     let active = true;
-    const now = new Date();
-    const defaultStart = new Date(now.getTime() - 24 * 3600 * 1000).toISOString().slice(0, 16);
-    const defaultEnd = now.toISOString().slice(0, 16);
-
-    const s = startDate || defaultStart;
-    const e = endDate || defaultEnd;
-
-    if (!startDate) setStartDate(defaultStart);
-    if (!endDate) setEndDate(defaultEnd);
-
     const run = async () => {
       try {
-        const startIso = new Date(s).toISOString();
-        const endIso = new Date(e).toISOString();
+        const { startIso, endIso } = getFilterDates();
         const res = await fetch(
           `/api/telemetry/history?device_id=${encodeURIComponent(deviceId)}&start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}&limit=1000`,
           { cache: 'no-store' }
@@ -78,19 +77,7 @@ export default function HistoryPage() {
     return () => {
       active = false;
     };
-  }, [deviceId, startDate, endDate]);
-
-  const handleExportCsv = () => {
-    const startIso = startDate ? new Date(startDate).toISOString() : '';
-    const endIso = endDate ? new Date(endDate).toISOString() : '';
-    const url = `/api/telemetry/history?device_id=${encodeURIComponent(deviceId)}&start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}&format=csv`;
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `motor_telemetry_${deviceId}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+  }, [deviceId, getFilterDates]);
 
   // Pagination
   const totalPages = Math.ceil(records.length / pageSize) || 1;

@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 test.describe('API Security, Ingestion Validation, and Config Synchronization', () => {
-  const VALID_TOKEN = process.env.DEVICE_INGEST_TOKEN || 'secret_device_token_change_in_production_motor_001';
+  const VALID_TOKEN = process.env.DEVICE_INGEST_TOKEN || 'test_device_token_e2e_local';
 
   test('Case 7: Rejection of invalid payloads (physical range & non-finite numbers)', async ({ request }) => {
     // 1. Extreme temperature (>180 C)

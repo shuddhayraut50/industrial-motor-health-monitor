@@ -81,8 +81,11 @@ export async function POST(request: NextRequest) {
         device_id: payload.device_id,
         record_id: savedRecord.id,
         recorded_at: authoritativeRecordedAt,
-        motor_temp: payload.motor_temp_c,
-        rms_z: payload.rms_z_g,
+        motor_temp: payload.motor_temp_c ?? null,
+        ambient_temp: payload.ambient_temp_c ?? null,
+        rms_z: payload.rms_z_g ?? null,
+        sensor_status: payload.sensor_status ?? null,
+        wifi_rssi: payload.wifi_rssi_dbm ?? null,
       })
     );
 
@@ -92,6 +95,7 @@ export async function POST(request: NextRequest) {
         device_id: savedRecord.device_id,
         recorded_at: savedRecord.recorded_at,
         id: savedRecord.id,
+        sensor_status: savedRecord.sensor_status ?? null,
       },
       {
         status: 201,
@@ -110,14 +114,20 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Diagnostic endpoint check
+// Telemetry ingestion is strictly POST-only
 export async function GET() {
-  return NextResponse.json({
-    status: 'online',
-    service: 'industrial-motor-health-monitor',
-    endpoint: '/api/telemetry',
-    instruction: 'Send telemetry summaries via HTTP POST with header x-device-token',
-  });
+  return NextResponse.json(
+    {
+      error: 'Method Not Allowed',
+      message: 'Telemetry ingestion endpoint accepts only HTTP POST requests with header x-device-token',
+    },
+    {
+      status: 405,
+      headers: {
+        Allow: 'POST, OPTIONS',
+      },
+    }
+  );
 }
 
 export async function OPTIONS() {

@@ -45,3 +45,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# firmware local secrets and developer tool configs
+firmware/secrets.h
+firmware/compile_flags.txt
+.clangd

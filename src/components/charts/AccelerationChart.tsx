@@ -24,9 +24,9 @@ export const AccelerationChart: React.FC<AccelerationChartProps> = ({
 }) => {
   const formattedData = data.map((d) => ({
     time: new Date(d.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    ax: Number(d.ax_g),
-    ay: Number(d.ay_g),
-    az: Number(d.az_g),
+    ax: d.ax_g !== null && d.ax_g !== undefined && Number.isFinite(Number(d.ax_g)) ? Number(d.ax_g) : null,
+    ay: d.ay_g !== null && d.ay_g !== undefined && Number.isFinite(Number(d.ay_g)) ? Number(d.ay_g) : null,
+    az: d.az_g !== null && d.az_g !== undefined && Number.isFinite(Number(d.az_g)) ? Number(d.az_g) : null,
   }));
 
   if (formattedData.length === 0) {

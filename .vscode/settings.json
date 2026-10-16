@@ -1,0 +1,11 @@
+{
+  "files.associations": {
+    "*.ino": "cpp"
+  },
+  "clangd.fallbackFlags": [
+    "-xc++",
+    "-std=gnu++17",
+    "-DESP32",
+    "-DESP32S3"
+  ]
+}

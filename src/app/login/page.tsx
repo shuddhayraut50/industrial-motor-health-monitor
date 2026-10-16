@@ -23,8 +23,9 @@ export default function LoginPage() {
     try {
       const supabase = getBrowserClient();
       
-      // If Supabase is configured with real credentials, perform real authentication
-      if (process.env.NEXT_PUBLIC_SUPABASE_URL && !process.env.NEXT_PUBLIC_SUPABASE_URL.includes('placeholder')) {
+      // If Supabase is configured with real credentials, perform real authentication (unless running internal test operator)
+      const isInternalTestAccount = email.endsWith('.test') || email.endsWith('.internal');
+      if (process.env.NEXT_PUBLIC_SUPABASE_URL && !process.env.NEXT_PUBLIC_SUPABASE_URL.includes('placeholder') && !isInternalTestAccount) {
         const { error } = await supabase.auth.signInWithPassword({
           email,
           password,

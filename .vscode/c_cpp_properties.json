@@ -1,0 +1,23 @@
+{
+  "configurations": [
+    {
+      "name": "ESP32-S3",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/Users/Shudd/.platformio/packages/framework-arduinoespressif32/cores/esp32",
+        "C:/Users/Shudd/.platformio/packages/framework-arduinoespressif32/libraries/**",
+        "C:/Users/Shudd/OneDrive/Documents/Arduino/libraries/**"
+      ],
+      "defines": [
+        "ESP32",
+        "ARDUINO=10800",
+        "ARDUINO_ARCH_ESP32",
+        "ESP32S3"
+      ],
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-gcc-x64"
+    }
+  ],
+  "version": 4
+}

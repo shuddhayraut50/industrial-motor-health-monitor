@@ -31,6 +31,23 @@ export async function GET(request: NextRequest) {
       isStale = ageSeconds > gracePeriodSec;
     }
 
+    // Independent sensor health statuses
+    const sensorHealth = {
+      esp32: isOnline ? (isStale ? 'stale' : 'online') : 'offline',
+      wifi: isOnline
+        ? { status: 'connected', rssi_dbm: latest?.wifi_rssi_dbm ?? device?.wifi_rssi_dbm ?? null }
+        : { status: 'offline', rssi_dbm: null },
+      adxl345: !isOnline
+        ? 'no_data'
+        : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
+      motor_temp: !isOnline
+        ? 'no_data'
+        : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
+      ambient_temp: !isOnline
+        ? 'no_data'
+        : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+    };
+
     return NextResponse.json(
       {
         device,
@@ -38,6 +55,8 @@ export async function GET(request: NextRequest) {
         is_online: isOnline,
         is_stale: isStale,
         age_seconds: ageSeconds,
+        sensor_health: sensorHealth,
+        last_successful_telemetry: latest?.recorded_at ?? device?.last_seen_at ?? null,
         reporting_interval_ms: config?.reporting_interval_ms ?? 1000,
         config_version: config?.config_version ?? 1,
         count: records.length,

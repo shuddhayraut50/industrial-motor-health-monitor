@@ -22,12 +22,16 @@ export const TemperatureChart: React.FC<TemperatureChartProps> = ({
   data,
   height = 280,
 }) => {
-  const formattedData = data.map((d) => ({
-    time: new Date(d.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    motor_temp: Number(d.motor_temp_c),
-    ambient_temp: Number(d.ambient_temp_c),
-    diff: Number((Number(d.motor_temp_c) - Number(d.ambient_temp_c)).toFixed(2)),
-  }));
+  const formattedData = data.map((d) => {
+    const hasMotor = d.motor_temp_c !== null && d.motor_temp_c !== undefined && Number.isFinite(Number(d.motor_temp_c));
+    const hasAmb = d.ambient_temp_c !== null && d.ambient_temp_c !== undefined && Number.isFinite(Number(d.ambient_temp_c));
+    return {
+      time: new Date(d.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      motor_temp: hasMotor ? Number(d.motor_temp_c) : null,
+      ambient_temp: hasAmb ? Number(d.ambient_temp_c) : null,
+      diff: hasMotor && hasAmb ? Number((Number(d.motor_temp_c) - Number(d.ambient_temp_c)).toFixed(2)) : null,
+    };
+  });
 
   if (formattedData.length === 0) {
     return (

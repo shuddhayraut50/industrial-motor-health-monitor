@@ -28,6 +28,22 @@ export async function GET() {
           isStale = ageSeconds > gracePeriodSec;
         }
 
+        const sensorHealth = {
+          esp32: isOnline ? (isStale ? 'stale' : 'online') : 'offline',
+          wifi: isOnline
+            ? { status: 'connected', rssi_dbm: latest?.wifi_rssi_dbm ?? dev?.wifi_rssi_dbm ?? null }
+            : { status: 'offline', rssi_dbm: null },
+          adxl345: !isOnline
+            ? 'no_data'
+            : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
+          motor_temp: !isOnline
+            ? 'no_data'
+            : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
+          ambient_temp: !isOnline
+            ? 'no_data'
+            : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+        };
+
         return {
           device: dev,
           latest,
@@ -36,6 +52,8 @@ export async function GET() {
           is_online: isOnline,
           is_stale: isStale,
           age_seconds: ageSeconds,
+          sensor_health: sensorHealth,
+          last_successful_telemetry: latest?.recorded_at ?? dev?.last_seen_at ?? null,
         };
       })
     );

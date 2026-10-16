@@ -26,12 +26,14 @@
 The SQL migrations are versioned in `supabase/migrations/`:
 - `00001_initial_schema.sql`: Core schema, foreign keys, indexes, and RLS policies.
 - `00002_seed_prototype_device.sql`: Provisions prototype device `motor-monitor-001` and initial config.
+- `00003_sensor_health_and_nullable_telemetry.sql`: Makes sensor columns nullable and introduces `sensor_status` and `wifi_rssi_dbm` for independent sensor health monitoring.
 
 #### Option A: Via Supabase SQL Editor (Recommended & Fastest)
 1. Open your new Supabase project in the browser.
 2. In the left navigation, select **SQL Editor** (`/sql/new`).
 3. Open `supabase/migrations/00001_initial_schema.sql` from this repository, copy all contents, paste into the editor, and click **Run**.
 4. Open `supabase/migrations/00002_seed_prototype_device.sql`, paste into the SQL Editor, and click **Run**.
+5. Open `supabase/migrations/00003_sensor_health_and_nullable_telemetry.sql`, paste into the SQL Editor, and click **Run**.
 
 #### Option B: Via Supabase CLI
 ```bash

@@ -33,21 +33,29 @@ export async function GET(request: NextRequest) {
       const csvRows = [headers.join(',')];
 
       for (const r of records) {
-        const diff = (Number(r.motor_temp_c) - Number(r.ambient_temp_c)).toFixed(2);
+        const hasBothTemps =
+          r.motor_temp_c !== null &&
+          r.motor_temp_c !== undefined &&
+          r.ambient_temp_c !== null &&
+          r.ambient_temp_c !== undefined;
+        const diff = hasBothTemps
+          ? (Number(r.motor_temp_c) - Number(r.ambient_temp_c)).toFixed(2)
+          : '';
+
         csvRows.push(
           [
             r.id,
             `"${r.device_id}"`,
             `"${r.recorded_at}"`,
-            r.motor_temp_c,
-            r.ambient_temp_c,
+            r.motor_temp_c ?? '',
+            r.ambient_temp_c ?? '',
             diff,
-            r.ax_g,
-            r.ay_g,
-            r.az_g,
-            r.rms_x_g,
-            r.rms_y_g,
-            r.rms_z_g,
+            r.ax_g ?? '',
+            r.ay_g ?? '',
+            r.az_g ?? '',
+            r.rms_x_g ?? '',
+            r.rms_y_g ?? '',
+            r.rms_z_g ?? '',
             `"${r.firmware_version || 'unknown'}"`,
           ].join(',')
         );

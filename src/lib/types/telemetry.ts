@@ -1,16 +1,26 @@
+export type SensorState = 'ready' | 'not_detected' | 'error' | 'no_data';
+
+export interface SensorStatusMap {
+  adxl345?: SensorState;
+  motor_temp?: SensorState;
+  ambient_temp?: SensorState;
+}
+
 export interface TelemetryPayload {
   device_id: string;
-  motor_temp_c: number;
-  ambient_temp_c: number;
-  ax_g: number;
-  ay_g: number;
-  az_g: number;
-  rms_x_g: number;
-  rms_y_g: number;
-  rms_z_g: number;
+  motor_temp_c?: number | null;
+  ambient_temp_c?: number | null;
+  ax_g?: number | null;
+  ay_g?: number | null;
+  az_g?: number | null;
+  rms_x_g?: number | null;
+  rms_y_g?: number | null;
+  rms_z_g?: number | null;
   firmware_version?: string;
-  sample_count?: number;
-  acquisition_quality?: number;
+  sample_count?: number | null;
+  acquisition_quality?: number | null;
+  wifi_rssi_dbm?: number | null;
+  sensor_status?: SensorStatusMap;
 }
 
 export interface TelemetryRecord extends TelemetryPayload {
@@ -26,6 +36,8 @@ export interface DeviceRecord {
   location: string;
   enabled: boolean;
   last_seen_at: string | null;
+  wifi_rssi_dbm?: number | null;
+  sensor_status?: SensorStatusMap;
   created_at: string;
   updated_at: string;
 }

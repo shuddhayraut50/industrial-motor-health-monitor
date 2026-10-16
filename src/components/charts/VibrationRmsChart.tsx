@@ -24,9 +24,9 @@ export const VibrationRmsChart: React.FC<VibrationRmsChartProps> = ({
 }) => {
   const formattedData = data.map((d) => ({
     time: new Date(d.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    rms_x: Number(d.rms_x_g),
-    rms_y: Number(d.rms_y_g),
-    rms_z: Number(d.rms_z_g),
+    rms_x: d.rms_x_g !== null && d.rms_x_g !== undefined && Number.isFinite(Number(d.rms_x_g)) ? Number(d.rms_x_g) : null,
+    rms_y: d.rms_y_g !== null && d.rms_y_g !== undefined && Number.isFinite(Number(d.rms_y_g)) ? Number(d.rms_y_g) : null,
+    rms_z: d.rms_z_g !== null && d.rms_z_g !== undefined && Number.isFinite(Number(d.rms_z_g)) ? Number(d.rms_z_g) : null,
   }));
 
   if (formattedData.length === 0) {
