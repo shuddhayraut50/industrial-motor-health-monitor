@@ -31,24 +31,26 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 
 // Device Identification
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.1.0";
+const char *FIRMWARE_VERSION = "1.2.0";
 
 // Reporting intervals
-const uint32_t SAMPLE_INTERVAL_US = 5000; // 5000us = 5ms -> 200 Hz sampling rate
-const uint32_t REPORT_INTERVAL_MS = 1000; // 1-second telemetry upload interval
-const uint32_t TEMP_CONV_MS = 750;        // 12-bit DS18B20 conversion time
+const uint32_t SAMPLE_INTERVAL_US = 5000;   // 5000us = 5ms -> 200 Hz target sampling rate
+const uint32_t REPORT_INTERVAL_MS = 5000;   // 5-second telemetry summary upload interval
+const uint32_t TEMP_CONV_MS = 750;          // 12-bit DS18B20 conversion time
 const uint32_t REDISCOVERY_INTERVAL_MS = 15000; // 15-second re-scan interval for missing sensors
 
 // ==============================================================================
 // 2. HARDWARE PIN DEFINITIONS
 // ==============================================================================
-// ADXL345 I2C Pins (ESP32-S3 default hardware I2C or custom wiring)
+// ADXL345 I2C Pins (ESP32-S3 default hardware I2C)
 constexpr int SDA_PIN = 8;
 constexpr int SCL_PIN = 9;
 constexpr uint8_t ADXL_ADDRESS = 0x53;
 
-// DS18B20 1-Wire Shared Bus Pin
-constexpr int ONEWIRE_PIN = 11;
+// Dedicated Independent OneWire Bus Pins for DS18B20 Probes
+// Separate buses ensure no enumeration order swapping; each probe is role-identified.
+constexpr int MOTOR_TEMP_PIN = 10;   // Motor-bearing temperature probe on GPIO 10 (4.7k pull-up to 3.3V)
+constexpr int AMBIENT_TEMP_PIN = 11; // Ambient reference temperature probe on GPIO 11 (4.7k pull-up to 3.3V)
 
 // ADXL345 Registers & Constants
 constexpr uint8_t REG_DEVID = 0x00;
@@ -61,8 +63,12 @@ constexpr float G_PER_LSB = 0.0039f; // Full-resolution scale: ~3.9 mg/LSB
 // ==============================================================================
 // 3. INDEPENDENT SENSOR STATE & STATS STRUCTURES
 // ==============================================================================
-OneWire oneWire(ONEWIRE_PIN);
-DallasTemperature temperatures(&oneWire);
+// Separate OneWire and DallasTemperature instances for GPIO 10 and GPIO 11
+OneWire oneWireMotor(MOTOR_TEMP_PIN);
+DallasTemperature sensorMotor(&oneWireMotor);
+
+OneWire oneWireAmbient(AMBIENT_TEMP_PIN);
+DallasTemperature sensorAmbient(&oneWireAmbient);
 
 DeviceAddress motorProbeAddress;
 DeviceAddress ambientProbeAddress;
@@ -95,6 +101,7 @@ struct VibrationAccumulator {
   double sumSqZ = 0;
   uint32_t sampleCount = 0;
   uint32_t i2cErrors = 0;
+  uint32_t missedSlots = 0;
 };
 
 VibrationAccumulator liveVibration;
@@ -118,7 +125,7 @@ bool readRegisters(uint8_t reg, uint8_t *buffer, size_t length) {
   }
 
   size_t received =
-      Wire.requestFrom((uint8_t)ADXL_ADDRESS, (uint8_t)length, (bool)true);
+      Wire.requestFrom((uint8_t)ADXL_ADDRESS, (size_t)length, true);
   if (received != length) {
     while (Wire.available())
       Wire.read();
@@ -199,6 +206,15 @@ void vibrationSamplingTask(void *parameter) {
   const TickType_t periodTicks = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1; // 5ms = 200 Hz
 
   for (;;) {
+    TickType_t nowTick = xTaskGetTickCount();
+    // Track if schedule was delayed (missed slot)
+    if (nowTick > lastWakeTime + periodTicks) {
+      if (xSemaphoreTake(vibrationMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        liveVibration.missedSlots++;
+        xSemaphoreGive(vibrationMutex);
+      }
+    }
+
     if (adxlReady) {
       float ax, ay, az;
       if (readAcceleration(ax, ay, az)) {
@@ -224,68 +240,61 @@ void vibrationSamplingTask(void *parameter) {
 }
 
 // ==============================================================================
-// 6. INDEPENDENT DS18B20 1-WIRE BUS HANDLING
+// 6. INDEPENDENT DEDICATED DS18B20 1-WIRE BUS HANDLING
 // ==============================================================================
 void discoverTemperatureProbes(bool verbose = true) {
-  temperatures.begin();
-  temperatures.setResolution(12);
-  temperatures.setWaitForConversion(false); // Enable non-blocking conversions
-
-  int deviceCount = temperatures.getDeviceCount();
-  if (verbose) {
-    Serial.printf("[DS18B20] Bus Scan on GPIO %d: Detected %d probe(s)\n",
-                  ONEWIRE_PIN, deviceCount);
-  }
+  // --- 1. Motor-bearing Probe on dedicated GPIO 10 OneWire bus ---
+  sensorMotor.begin();
+  sensorMotor.setResolution(12);
+  sensorMotor.setWaitForConversion(false);
 
   motorProbeFound = false;
-  ambientProbeFound = false;
-
-  if (deviceCount == 0) {
+  int motorCount = sensorMotor.getDeviceCount();
+  if (motorCount > 0 && sensorMotor.getAddress(motorProbeAddress, 0)) {
+    motorProbeFound = true;
     if (verbose) {
-      Serial.println("[DS18B20] WARNING: No temperature probes detected. Telemetry will report temperatures as null.");
+      Serial.printf("[DS18B20-MOTOR] GPIO %d: Detected probe ROM: ", MOTOR_TEMP_PIN);
+      for (uint8_t b = 0; b < 8; b++) {
+        if (motorProbeAddress[b] < 0x10) Serial.print("0");
+        Serial.print(motorProbeAddress[b], HEX);
+      }
+      Serial.println(" -> Motor Stator Probe ONLINE");
     }
+  } else {
     motorTempValid = false;
-    ambientTempValid = false;
-    return;
-  }
-
-  for (int i = 0; i < deviceCount; i++) {
-    DeviceAddress addr;
-    if (temperatures.getAddress(addr, i)) {
-      if (verbose) {
-        Serial.printf("  Probe %d ROM: ", i + 1);
-        for (uint8_t b = 0; b < 8; b++) {
-          if (addr[b] < 0x10) Serial.print("0");
-          Serial.print(addr[b], HEX);
-        }
-        Serial.println();
-      }
-
-      if (!motorProbeFound) {
-        memcpy(motorProbeAddress, addr, sizeof(DeviceAddress));
-        motorProbeFound = true;
-      } else if (!ambientProbeFound) {
-        memcpy(ambientProbeAddress, addr, sizeof(DeviceAddress));
-        ambientProbeFound = true;
-      }
-    }
-  }
-
-  if (deviceCount == 1) {
     if (verbose) {
-      Serial.println("[DS18B20] SINGLE PROBE MODE: Assigned to Motor Stator. Ambient probe is NOT connected (will be sent as null).");
-    }
-    ambientProbeFound = false;
-    ambientTempValid = false;
-  } else if (deviceCount >= 2) {
-    if (verbose) {
-      Serial.println("[DS18B20] DUAL PROBE MODE: Probe 1 = Motor Stator, Probe 2 = Ambient Reference.");
+      Serial.printf("[DS18B20-MOTOR] GPIO %d: NOT DETECTED (Check wiring & 4.7k pull-up to 3.3V)\n", MOTOR_TEMP_PIN);
     }
   }
 
-  // Trigger first conversion
-  temperatures.requestTemperatures();
-  tempConversionPending = true;
+  // --- 2. Ambient Reference Probe on dedicated GPIO 11 OneWire bus ---
+  sensorAmbient.begin();
+  sensorAmbient.setResolution(12);
+  sensorAmbient.setWaitForConversion(false);
+
+  ambientProbeFound = false;
+  int ambCount = sensorAmbient.getDeviceCount();
+  if (ambCount > 0 && sensorAmbient.getAddress(ambientProbeAddress, 0)) {
+    ambientProbeFound = true;
+    if (verbose) {
+      Serial.printf("[DS18B20-AMBIENT] GPIO %d: Detected probe ROM: ", AMBIENT_TEMP_PIN);
+      for (uint8_t b = 0; b < 8; b++) {
+        if (ambientProbeAddress[b] < 0x10) Serial.print("0");
+        Serial.print(ambientProbeAddress[b], HEX);
+      }
+      Serial.println(" -> Ambient Air Reference Probe ONLINE");
+    }
+  } else {
+    ambientTempValid = false;
+    if (verbose) {
+      Serial.printf("[DS18B20-AMBIENT] GPIO %d: NOT DETECTED (Check wiring & 4.7k pull-up to 3.3V)\n", AMBIENT_TEMP_PIN);
+    }
+  }
+
+  // Trigger non-blocking conversion for detected probes
+  if (motorProbeFound) sensorMotor.requestTemperatures();
+  if (ambientProbeFound) sensorAmbient.requestTemperatures();
+  tempConversionPending = (motorProbeFound || ambientProbeFound);
   lastTempRequestMs = millis();
 }
 
@@ -295,37 +304,36 @@ void updateTemperatures() {
     tempConversionPending = false;
 
     if (motorProbeFound) {
-      float t = temperatures.getTempC(motorProbeAddress);
+      float t = sensorMotor.getTempC(motorProbeAddress);
       if (isfinite(t) && t != DEVICE_DISCONNECTED_C && t >= -40.0f && t <= 180.0f) {
         currentMotorTemp = t;
         motorTempValid = true;
       } else {
         motorTempValid = false;
-        Serial.printf("[DS18B20] ERROR: Motor probe read failed (val: %.1f C). Marking unavailable.\n", t);
+        Serial.printf("[DS18B20-MOTOR] Read error (%.1f C) on GPIO %d. Marking probe invalid.\n", t, MOTOR_TEMP_PIN);
       }
     } else {
       motorTempValid = false;
     }
 
     if (ambientProbeFound) {
-      float t = temperatures.getTempC(ambientProbeAddress);
+      float t = sensorAmbient.getTempC(ambientProbeAddress);
       if (isfinite(t) && t != DEVICE_DISCONNECTED_C && t >= -40.0f && t <= 85.0f) {
         currentAmbientTemp = t;
         ambientTempValid = true;
       } else {
         ambientTempValid = false;
-        Serial.printf("[DS18B20] ERROR: Ambient probe read failed (val: %.1f C). Marking unavailable.\n", t);
+        Serial.printf("[DS18B20-AMBIENT] Read error (%.1f C) on GPIO %d. Marking probe invalid.\n", t, AMBIENT_TEMP_PIN);
       }
     } else {
       ambientTempValid = false;
     }
 
-    // Trigger next conversion cycle if at least one probe exists
-    if (motorProbeFound || ambientProbeFound) {
-      temperatures.requestTemperatures();
-      tempConversionPending = true;
-      lastTempRequestMs = millis();
-    }
+    // Trigger next conversion cycle for active probes
+    if (motorProbeFound) sensorMotor.requestTemperatures();
+    if (ambientProbeFound) sensorAmbient.requestTemperatures();
+    tempConversionPending = (motorProbeFound || ambientProbeFound);
+    lastTempRequestMs = millis();
   }
 }
 
@@ -340,9 +348,26 @@ void checkSensorRecovery() {
       initialiseADXL345(false);
     }
 
-    // Retry 1-Wire temperature discovery if either probe is missing
-    if (!motorProbeFound || !ambientProbeFound) {
-      discoverTemperatureProbes(false);
+    // Hot-plug re-check for motor probe on GPIO 10
+    if (!motorProbeFound) {
+      sensorMotor.begin();
+      if (sensorMotor.getDeviceCount() > 0 && sensorMotor.getAddress(motorProbeAddress, 0)) {
+        motorProbeFound = true;
+        sensorMotor.requestTemperatures();
+        tempConversionPending = true;
+        Serial.println("[DS18B20-MOTOR] Hot-plug recovery: Motor probe reconnected on GPIO 10.");
+      }
+    }
+
+    // Hot-plug re-check for ambient probe on GPIO 11
+    if (!ambientProbeFound) {
+      sensorAmbient.begin();
+      if (sensorAmbient.getDeviceCount() > 0 && sensorAmbient.getAddress(ambientProbeAddress, 0)) {
+        ambientProbeFound = true;
+        sensorAmbient.requestTemperatures();
+        tempConversionPending = true;
+        Serial.println("[DS18B20-AMBIENT] Hot-plug recovery: Ambient probe reconnected on GPIO 11.");
+      }
     }
   }
 }
@@ -360,6 +385,12 @@ void startWiFiConnection() {
 
 void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
+    static bool ipPrinted = false;
+    if (!ipPrinted) {
+      Serial.printf("[WIFI] Connected! IP: %s | RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      ipPrinted = true;
+    }
     return;
   }
 
@@ -380,10 +411,11 @@ bool uploadTelemetry(
     bool hasAmbientTemp, float ambientTemp,
     bool hasVibration, float ax, float ay, float az,
     float rmsX, float rmsY, float rmsZ,
-    uint32_t sampleCount
+    uint32_t sampleCount, float acquisitionQuality,
+    uint32_t i2cErrors, uint32_t missedSlots
 ) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[HTTP] Upload skipped: Wi-Fi not connected (Status: %d)\n", WiFi.status());
+    Serial.printf("[HTTP] Upload skipped: Wi-Fi disconnected (Status: %d)\n", WiFi.status());
     return false;
   }
 
@@ -395,13 +427,13 @@ bool uploadTelemetry(
 
   HTTPClient https;
   if (!https.begin(client, SERVER_TELEMETRY_URL)) {
-    Serial.println("[HTTP] ERROR: Unable to establish HTTPS connection to ingestion server!");
+    Serial.printf("[HTTP] ERROR: Unable to initiate HTTPS connection to %s\n", SERVER_TELEMETRY_URL);
     return false;
   }
 
   https.addHeader("Content-Type", "application/json");
   https.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
-  https.setTimeout(3000); // 3-second timeout
+  https.setTimeout(4000); // 4-second timeout
 
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
@@ -413,21 +445,21 @@ bool uploadTelemetry(
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["wifi_rssi_dbm"] = wifiRssi;
 
-  // 1. Motor Temperature (Null if not detected/valid)
+  // 1. Motor Temperature (GPIO 10)
   if (hasMotorTemp) {
     doc["motor_temp_c"] = motorTemp;
   } else {
     doc["motor_temp_c"] = nullptr;
   }
 
-  // 2. Ambient Temperature (Null if not detected/valid - NEVER fabricated)
+  // 2. Ambient Temperature (GPIO 11) - NEVER fabricated
   if (hasAmbientTemp) {
     doc["ambient_temp_c"] = ambientTemp;
   } else {
     doc["ambient_temp_c"] = nullptr;
   }
 
-  // 3. ADXL345 Vibration (Null if sensor unavailable)
+  // 3. ADXL345 Vibration (I2C 0x53)
   if (hasVibration) {
     doc["ax_g"] = ax;
     doc["ay_g"] = ay;
@@ -436,6 +468,9 @@ bool uploadTelemetry(
     doc["rms_y_g"] = rmsY;
     doc["rms_z_g"] = rmsZ;
     doc["sample_count"] = sampleCount;
+    doc["acquisition_quality"] = acquisitionQuality;
+    doc["i2c_errors"] = i2cErrors;
+    doc["missed_sample_slots"] = missedSlots;
   } else {
     doc["ax_g"] = nullptr;
     doc["ay_g"] = nullptr;
@@ -444,6 +479,9 @@ bool uploadTelemetry(
     doc["rms_y_g"] = nullptr;
     doc["rms_z_g"] = nullptr;
     doc["sample_count"] = 0;
+    doc["acquisition_quality"] = 0.0f;
+    doc["i2c_errors"] = i2cErrors;
+    doc["missed_sample_slots"] = missedSlots;
   }
 
   // 4. Structured Independent Sensor Status
@@ -464,31 +502,49 @@ bool uploadTelemetry(
   if (httpCode >= 200 && httpCode < 300) {
     char motorStr[16];
     char ambStr[16];
-    char rmsStr[32];
+    char diffStr[16];
+    char rmsStr[36];
 
     if (hasMotorTemp) snprintf(motorStr, sizeof(motorStr), "%.1f C", motorTemp);
-    else snprintf(motorStr, sizeof(motorStr), "null");
+    else snprintf(motorStr, sizeof(motorStr), "null (Missing)");
 
     if (hasAmbientTemp) snprintf(ambStr, sizeof(ambStr), "%.1f C", ambientTemp);
-    else snprintf(ambStr, sizeof(ambStr), "null");
+    else snprintf(ambStr, sizeof(ambStr), "null (Missing)");
+
+    if (hasMotorTemp && hasAmbientTemp) snprintf(diffStr, sizeof(diffStr), "%+.1f C", motorTemp - ambientTemp);
+    else snprintf(diffStr, sizeof(diffStr), "N/A");
 
     if (hasVibration) snprintf(rmsStr, sizeof(rmsStr), "(%.3f, %.3f, %.3f)g", rmsX, rmsY, rmsZ);
-    else snprintf(rmsStr, sizeof(rmsStr), "null");
+    else snprintf(rmsStr, sizeof(rmsStr), "null (Offline)");
 
-    Serial.printf("[HTTP] Ingest OK (%d) | RSSI: %d dBm | Motor: %s | Amb: %s | RMS: %s\n",
-                  httpCode, wifiRssi, motorStr, ambStr, rmsStr);
+    Serial.println("--------------------------------------------------------------------------------");
+    Serial.printf("[HTTP %d] Telemetry Accepted | Target: %s\n", httpCode, SERVER_TELEMETRY_URL);
+    Serial.printf("  Wi-Fi RSSI: %d dBm | Samples: %u | Quality: %.0f%% | Missed Slots: %u | I2C Err: %u\n",
+                  wifiRssi, sampleCount, acquisitionQuality * 100.0f, missedSlots, i2cErrors);
+    Serial.printf("  Motor (GPIO 10): %s | Ambient (GPIO 11): %s | Delta-T: %s\n",
+                  motorStr, ambStr, diffStr);
+    Serial.printf("  RMS Vibration: %s | DC Mean: (%.3f, %.3f, %.3f)g\n",
+                  rmsStr, ax, ay, az);
+    Serial.println("--------------------------------------------------------------------------------");
     https.end();
     return true;
   } else {
-    Serial.printf("[HTTP] Ingest FAILED (HTTP %d): %s\n",
-                  httpCode, https.getString().c_str());
+    String resp = https.getString();
+    if (resp.length() > 120) resp = resp.substring(0, 120) + "...";
+    Serial.printf("[HTTP %d ERROR] Telemetry Rejected by %s: %s\n",
+                  httpCode, SERVER_TELEMETRY_URL, resp.c_str());
+    if (httpCode == 401) {
+      Serial.println("  -> AUTH FAILED: Check DEVICE_INGEST_TOKEN in firmware/secrets.h matches Vercel environment.");
+    } else if (httpCode == 400) {
+      Serial.println("  -> VALIDATION FAILED: Check payload field ranges and non-finite values.");
+    }
     https.end();
     return false;
   }
 }
 
 // ==============================================================================
-// 9. ONE-SECOND TELEMETRY CALCULATION & REPORTING
+// 9. FIVE-SECOND TELEMETRY CALCULATION & REPORTING
 // ==============================================================================
 void reportTelemetry() {
   VibrationAccumulator snapshot;
@@ -497,7 +553,7 @@ void reportTelemetry() {
     return;
   }
   snapshot = liveVibration;
-  liveVibration = VibrationAccumulator(); // Reset accumulator for the next 1-second window
+  liveVibration = VibrationAccumulator(); // Reset accumulator for the next 5-second window
   xSemaphoreGive(vibrationMutex);
 
   bool hasVibration = false;
@@ -512,10 +568,25 @@ void reportTelemetry() {
     meanZ = (float)(snapshot.sumZ / n);
 
     // True AC RMS removes the gravitational DC component from each axis
-    rmsX = sqrtf(fmaxf(0.0001f, (float)(snapshot.sumSqX / n) - (meanX * meanX)));
-    rmsY = sqrtf(fmaxf(0.0001f, (float)(snapshot.sumSqY / n) - (meanY * meanY)));
-    rmsZ = sqrtf(fmaxf(0.0001f, (float)(snapshot.sumSqZ / n) - (meanZ * meanZ)));
+    float varX = (float)(snapshot.sumSqX / n) - (meanX * meanX);
+    float varY = (float)(snapshot.sumSqY / n) - (meanY * meanY);
+    float varZ = (float)(snapshot.sumSqZ / n) - (meanZ * meanZ);
+    rmsX = sqrtf(fmaxf(0.0f, varX));
+    rmsY = sqrtf(fmaxf(0.0f, varY));
+    rmsZ = sqrtf(fmaxf(0.0f, varZ));
   }
+
+  uint32_t expectedSamples = (REPORT_INTERVAL_MS * 1000) / SAMPLE_INTERVAL_US; // 5000ms / 5ms = 1000 samples
+  uint32_t missedSlots = snapshot.missedSlots;
+  if (adxlReady && snapshot.sampleCount < expectedSamples) {
+    uint32_t deficit = expectedSamples - snapshot.sampleCount;
+    if (deficit > missedSlots) {
+      missedSlots = deficit;
+    }
+  }
+  float acquisitionQuality = (adxlReady && expectedSamples > 0)
+      ? fminf(1.0f, (float)snapshot.sampleCount / (float)expectedSamples)
+      : 0.0f;
 
   bool hasMotor = motorProbeFound && motorTempValid;
   bool hasAmbient = ambientProbeFound && ambientTempValid;
@@ -526,7 +597,10 @@ void reportTelemetry() {
       hasAmbient, currentAmbientTemp,
       hasVibration, meanX, meanY, meanZ,
       rmsX, rmsY, rmsZ,
-      snapshot.sampleCount
+      snapshot.sampleCount,
+      acquisitionQuality,
+      snapshot.i2cErrors,
+      missedSlots
   );
 }
 
@@ -541,15 +615,16 @@ void setup() {
   Serial.println("  Industrial Motor Health Monitor — ESP32-S3 Firmware   ");
   Serial.println("  Device: " + String(DEVICE_ID) +
                  " | FW: " + String(FIRMWARE_VERSION));
-  Serial.println("  Independent Sensor Isolation & Fault-Tolerant Telemetry");
+  Serial.println("  Hardware: ESP32-S3 N16R8");
+  Serial.println("  Wiring: ADXL345 (SDA:8, SCL:9) | Motor (GPIO 10) | Ambient (GPIO 11)");
   Serial.println("========================================================");
 
-  // 1. Initialise I2C for ADXL345
+  // 1. Initialise I2C for ADXL345 (SDA: GPIO 8, SCL: GPIO 9)
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000); // 400 kHz Fast I2C mode
   initialiseADXL345(true);
 
-  // 2. Initialise OneWire for DS18B20 temperature probes
+  // 2. Initialise OneWire for DS18B20 temperature probes (Motor: GPIO 10, Ambient: GPIO 11)
   discoverTemperatureProbes(true);
 
   // 3. Create FreeRTOS Mutex for vibration data
@@ -577,7 +652,7 @@ void setup() {
 
   lastReportMs = millis();
   lastRediscoveryMs = millis();
-  Serial.println("[SYSTEM] Setup complete. Entering operational fault-tolerant loop.\n");
+  Serial.println("[SYSTEM] Setup complete. Entering 5-second operational fault-tolerant loop.\n");
 }
 
 // ==============================================================================
@@ -593,7 +668,7 @@ void loop() {
   // Maintain Wi-Fi connection
   maintainWiFi();
 
-  // 1-second reporting cycle (never blocked by missing sensors)
+  // 5-second reporting cycle (never blocked by missing sensors)
   uint32_t now = millis();
   if (now - lastReportMs >= REPORT_INTERVAL_MS) {
     lastReportMs = now;

@@ -21,6 +21,8 @@ export interface TelemetryPayload {
   acquisition_quality?: number | null;
   wifi_rssi_dbm?: number | null;
   sensor_status?: SensorStatusMap;
+  i2c_errors?: number | null;
+  missed_sample_slots?: number | null;
 }
 
 export interface TelemetryRecord extends TelemetryPayload {

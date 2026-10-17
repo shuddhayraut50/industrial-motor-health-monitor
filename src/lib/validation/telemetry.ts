@@ -101,6 +101,22 @@ export const TelemetryPayloadSchema = z.object({
       ambient_temp: z.enum(['ready', 'not_detected', 'error', 'no_data']).optional(),
     })
     .optional(),
+
+  i2c_errors: z
+    .number()
+    .int()
+    .min(0)
+    .max(100000)
+    .nullable()
+    .optional(),
+
+  missed_sample_slots: z
+    .number()
+    .int()
+    .min(0)
+    .max(100000)
+    .nullable()
+    .optional(),
 });
 
 export type ValidatedTelemetryPayload = z.infer<typeof TelemetryPayloadSchema>;

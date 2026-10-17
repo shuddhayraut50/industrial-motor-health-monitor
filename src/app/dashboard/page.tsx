@@ -149,6 +149,13 @@ export default function DashboardPage() {
   const ay = isAdxlCurrentAndValid ? Number(latest.ay_g).toFixed(3) : null;
   const az = isAdxlCurrentAndValid ? Number(latest.az_g).toFixed(3) : null;
 
+  const sampleCount = latest?.sample_count !== null && latest?.sample_count !== undefined ? String(latest.sample_count) : null;
+  const acquisitionQuality = latest?.acquisition_quality !== null && latest?.acquisition_quality !== undefined
+    ? `${(Number(latest.acquisition_quality) * 100).toFixed(0)}%`
+    : null;
+  const i2cErrors = latest?.i2c_errors !== null && latest?.i2c_errors !== undefined ? String(latest.i2c_errors) : (isOnline ? '0' : null);
+  const missedSlots = latest?.missed_sample_slots !== null && latest?.missed_sample_slots !== undefined ? String(latest.missed_sample_slots) : (isOnline ? '0' : null);
+
   const motorSensorState: SensorState = isMotorCurrentAndValid
     ? 'ready'
     : (!isOnline || isStale)
@@ -331,7 +338,7 @@ export default function DashboardPage() {
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.motor_temp === 'ready' ? 'Stator Probe #1' : 'Probe Missing'}
+                {sensorHealth.motor_temp === 'ready' ? 'Stator (GPIO 10)' : 'Missing (GPIO 10)'}
               </span>
             </Card>
 
@@ -353,7 +360,7 @@ export default function DashboardPage() {
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.ambient_temp === 'ready' ? 'Air Probe #2' : 'Probe Missing'}
+                {sensorHealth.ambient_temp === 'ready' ? 'Ambient (GPIO 11)' : 'Missing (GPIO 11)'}
               </span>
             </Card>
 
@@ -558,6 +565,78 @@ export default function DashboardPage() {
               }
               status={isStale ? 'stale' : 'normal'}
               sensorState={adxlSensorState}
+            />
+          </div>
+        </div>
+
+        {/* Section 4: Sampling Diagnostics & Bus Health */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="w-4 h-4 text-emerald-400" />
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                Sampling Diagnostics & Bus Health
+              </h2>
+            </div>
+            <span className="text-xs text-slate-500 font-mono">200 Hz Sampling Cadence</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <MetricCard
+              id="metric-sample-count"
+              title="Window Sample Count"
+              value={sampleCount}
+              unit="samples"
+              subValue={
+                isOnline
+                  ? "Target: ~1,000 samples per 5-sec window"
+                  : "No recent telemetry"
+              }
+              status={isStale ? 'stale' : 'normal'}
+              sensorState={isOnline && !isStale && sampleCount !== null ? 'ready' : 'no_data'}
+              icon={<Activity className="w-4 h-4 text-emerald-400" />}
+            />
+            <MetricCard
+              id="metric-acquisition-quality"
+              title="Acquisition Quality"
+              value={acquisitionQuality}
+              unit=""
+              subValue={
+                isOnline
+                  ? "Core 0 scheduler timer completion ratio"
+                  : "No recent telemetry"
+              }
+              status={isStale ? 'stale' : 'normal'}
+              sensorState={isOnline && !isStale && acquisitionQuality !== null ? 'ready' : 'no_data'}
+              icon={<Gauge className="w-4 h-4 text-cyan-400" />}
+            />
+            <MetricCard
+              id="metric-i2c-errors"
+              title="I²C Bus Errors"
+              value={i2cErrors}
+              unit="err"
+              subValue={
+                isOnline
+                  ? Number(i2cErrors) === 0 ? "Clean communication with ADXL345" : "I2C bus retries occurred"
+                  : "No recent telemetry"
+              }
+              status={isStale ? 'stale' : Number(i2cErrors) > 0 ? 'warning' : 'normal'}
+              sensorState={isOnline && !isStale ? (Number(i2cErrors) > 0 ? 'error' : 'ready') : 'no_data'}
+              icon={<Cpu className="w-4 h-4 text-rose-400" />}
+            />
+            <MetricCard
+              id="metric-missed-slots"
+              title="Missed Sample Slots"
+              value={missedSlots}
+              unit="slots"
+              subValue={
+                isOnline
+                  ? Number(missedSlots) === 0 ? "Full 200 Hz cadence maintained" : "Timer scheduling delays"
+                  : "No recent telemetry"
+              }
+              status={isStale ? 'stale' : Number(missedSlots) > 0 ? 'warning' : 'normal'}
+              sensorState={isOnline && !isStale ? (Number(missedSlots) > 0 ? 'error' : 'ready') : 'no_data'}
+              icon={<Clock className="w-4 h-4 text-amber-400" />}
             />
           </div>
         </div>

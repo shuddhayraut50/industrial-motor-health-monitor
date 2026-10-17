@@ -24,9 +24,9 @@ export async function GET(request: NextRequest) {
       const recMs = new Date(latest.recorded_at).getTime();
       ageSeconds = Math.max(0, Math.round((nowMs - recMs) / 1000));
 
-      const reportingIntervalSec = (config?.reporting_interval_ms ?? 1000) / 1000;
-      // Online if data received within 3x reporting interval or at least within 10s
-      const gracePeriodSec = Math.max(10, reportingIntervalSec * 3);
+      const reportingIntervalSec = (config?.reporting_interval_ms ?? 5000) / 1000;
+      // Online if data received within 3x reporting interval or at least within 15s
+      const gracePeriodSec = Math.max(15, reportingIntervalSec * 3);
       isOnline = ageSeconds <= gracePeriodSec;
       isStale = ageSeconds > gracePeriodSec;
     }

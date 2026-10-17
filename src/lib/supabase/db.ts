@@ -212,6 +212,12 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.sensor_status) {
       telemetryInsertPayload.sensor_status = record.sensor_status;
     }
+    if (record.i2c_errors !== undefined) {
+      telemetryInsertPayload.i2c_errors = record.i2c_errors;
+    }
+    if (record.missed_sample_slots !== undefined) {
+      telemetryInsertPayload.missed_sample_slots = record.missed_sample_slots;
+    }
 
     let { data, error } = await admin
       .from('telemetry')
@@ -223,6 +229,8 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (error && (error.message.includes('column') || error.code === '42703')) {
       delete telemetryInsertPayload.wifi_rssi_dbm;
       delete telemetryInsertPayload.sensor_status;
+      delete telemetryInsertPayload.i2c_errors;
+      delete telemetryInsertPayload.missed_sample_slots;
       const retry = await admin
         .from('telemetry')
         .insert(telemetryInsertPayload)
@@ -270,6 +278,8 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     ...record,
     id: mockDb.telemetry.length + 1,
     recorded_at: recordedAt,
+    i2c_errors: record.i2c_errors ?? 0,
+    missed_sample_slots: record.missed_sample_slots ?? 0,
   };
 
   mockDb.telemetry.push(newRecord);

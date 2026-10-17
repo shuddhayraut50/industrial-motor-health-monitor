@@ -202,6 +202,51 @@ describe('TelemetryPayloadSchema validation', () => {
     const result = TelemetryPayloadSchema.safeParse(heartbeatOnly);
     expect(result.success).toBe(true);
   });
+
+  it('accepts telemetry with i2c_errors and missed_sample_slots diagnostics', () => {
+    const withDiagnostics = {
+      device_id: 'motor-monitor-001',
+      motor_temp_c: 34.2,
+      ambient_temp_c: 25.1,
+      ax_g: 0.02,
+      ay_g: -0.05,
+      az_g: 0.98,
+      rms_x_g: 0.012,
+      rms_y_g: 0.015,
+      rms_z_g: 0.018,
+      sample_count: 1000,
+      acquisition_quality: 1.0,
+      i2c_errors: 0,
+      missed_sample_slots: 2,
+    };
+
+    const result = TelemetryPayloadSchema.safeParse(withDiagnostics);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.i2c_errors).toBe(0);
+      expect(result.data.missed_sample_slots).toBe(2);
+      expect(result.data.acquisition_quality).toBe(1.0);
+    }
+  });
+
+  it('rejects negative i2c_errors and missed_sample_slots', () => {
+    const invalidDiagnostics = {
+      device_id: 'motor-monitor-001',
+      motor_temp_c: 34.2,
+      ambient_temp_c: 25.1,
+      ax_g: 0.02,
+      ay_g: -0.05,
+      az_g: 0.98,
+      rms_x_g: 0.012,
+      rms_y_g: 0.015,
+      rms_z_g: 0.018,
+      i2c_errors: -1,
+      missed_sample_slots: -5,
+    };
+
+    const result = TelemetryPayloadSchema.safeParse(invalidDiagnostics);
+    expect(result.success).toBe(false);
+  });
 });
 
 describe('DeviceConfigUpdateSchema validation', () => {
