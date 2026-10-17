@@ -79,13 +79,17 @@ export async function POST(request: NextRequest) {
       JSON.stringify({
         event: 'telemetry_ingested',
         device_id: payload.device_id,
-        record_id: savedRecord.id,
+        record_id: payload.record_id || savedRecord.id,
         recorded_at: authoritativeRecordedAt,
+        measured_at: payload.measured_at ?? null,
         motor_temp: payload.motor_temp_c ?? null,
         ambient_temp: payload.ambient_temp_c ?? null,
         rms_z: payload.rms_z_g ?? null,
         sensor_status: payload.sensor_status ?? null,
         wifi_rssi: payload.wifi_rssi_dbm ?? null,
+        sd_card: payload.sd_card_status ?? null,
+        rtc: payload.rtc_status ?? null,
+        unsynced_count: payload.unsynced_records_count ?? 0,
       })
     );
 
@@ -94,8 +98,12 @@ export async function POST(request: NextRequest) {
         success: true,
         device_id: savedRecord.device_id,
         recorded_at: savedRecord.recorded_at,
+        measured_at: savedRecord.measured_at ?? null,
+        record_id: savedRecord.record_id ?? null,
         id: savedRecord.id,
         sensor_status: savedRecord.sensor_status ?? null,
+        sd_card_status: savedRecord.sd_card_status ?? null,
+        rtc_status: savedRecord.rtc_status ?? null,
       },
       {
         status: 201,

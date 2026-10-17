@@ -25,13 +25,13 @@ export async function GET(request: NextRequest) {
       ageSeconds = Math.max(0, Math.round((nowMs - recMs) / 1000));
 
       const reportingIntervalSec = (config?.reporting_interval_ms ?? 5000) / 1000;
-      // Online if data received within 3x reporting interval or at least within 15s
-      const gracePeriodSec = Math.max(15, reportingIntervalSec * 3);
+      // Online if data received within 4x reporting interval or at least within 25s (prevents intermittent offline on HTTPS latency)
+      const gracePeriodSec = Math.max(25, reportingIntervalSec * 4);
       isOnline = ageSeconds <= gracePeriodSec;
       isStale = ageSeconds > gracePeriodSec;
     }
 
-    // Independent sensor health statuses
+    // Independent sensor and storage health statuses
     const sensorHealth = {
       esp32: isOnline ? (isStale ? 'stale' : 'online') : 'offline',
       wifi: isOnline
@@ -46,6 +46,15 @@ export async function GET(request: NextRequest) {
       ambient_temp: !isOnline
         ? 'no_data'
         : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+      sd_card: latest?.sd_card_status ?? device?.sd_card_status ?? 'not_initialized',
+      rtc: {
+        status: latest?.rtc_status ?? device?.rtc_status ?? 'not_detected',
+        synced: Boolean(latest?.rtc_synced),
+      },
+      offline_queue: {
+        unsynced_count: latest?.unsynced_records_count ?? device?.unsynced_records_count ?? 0,
+        oldest_timestamp: latest?.oldest_unsynced_timestamp ?? null,
+      },
     };
 
     return NextResponse.json(
@@ -57,7 +66,8 @@ export async function GET(request: NextRequest) {
         age_seconds: ageSeconds,
         sensor_health: sensorHealth,
         last_successful_telemetry: latest?.recorded_at ?? device?.last_seen_at ?? null,
-        reporting_interval_ms: config?.reporting_interval_ms ?? 1000,
+        last_measured_at: latest?.measured_at ?? device?.last_measured_at ?? null,
+        reporting_interval_ms: config?.reporting_interval_ms ?? 5000,
         config_version: config?.config_version ?? 1,
         count: records.length,
         records,

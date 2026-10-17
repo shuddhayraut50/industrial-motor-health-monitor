@@ -16,9 +16,10 @@ import {
   ArrowRight,
   Wifi,
   Activity,
+  HardDrive,
 } from 'lucide-react';
 import Link from 'next/link';
-import { TelemetryRecord, DeviceRecord, SensorState } from '@/lib/types/telemetry';
+import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState } from '@/lib/types/telemetry';
 
 export default function DashboardPage() {
   const [deviceId, setDeviceId] = useState(() => {
@@ -37,18 +38,25 @@ export default function DashboardPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastSynced, setLastSynced] = useState<string | null>(null);
   const [lastSuccessfulTelemetry, setLastSuccessfulTelemetry] = useState<string | null>(null);
+  const [lastMeasuredAt, setLastMeasuredAt] = useState<string | null>(null);
   const [sensorHealth, setSensorHealth] = useState<{
     esp32: 'online' | 'stale' | 'offline';
     wifi: { status: 'connected' | 'offline'; rssi_dbm: number | null };
     adxl345: SensorState;
     motor_temp: SensorState;
     ambient_temp: SensorState;
+    sd_card?: SdCardState;
+    rtc?: { status: RtcState; synced: boolean };
+    offline_queue?: { unsynced_count: number; oldest_timestamp: string | null };
   }>({
     esp32: 'offline',
     wifi: { status: 'offline', rssi_dbm: null },
     adxl345: 'no_data',
     motor_temp: 'no_data',
     ambient_temp: 'no_data',
+    sd_card: 'not_initialized',
+    rtc: { status: 'not_detected', synced: false },
+    offline_queue: { unsynced_count: 0, oldest_timestamp: null },
   });
 
   const applyData = (data: {
@@ -64,8 +72,12 @@ export default function DashboardPage() {
       adxl345: SensorState;
       motor_temp: SensorState;
       ambient_temp: SensorState;
+      sd_card?: SdCardState;
+      rtc?: { status: RtcState; synced: boolean };
+      offline_queue?: { unsynced_count: number; oldest_timestamp: string | null };
     };
     last_successful_telemetry?: string | null;
+    last_measured_at?: string | null;
   }) => {
     setDevice(data.device);
     setLatest(data.latest);
@@ -75,6 +87,7 @@ export default function DashboardPage() {
     setConfigVersion(data.config_version);
     setLastSynced(new Date().toISOString());
     setLastSuccessfulTelemetry(data.last_successful_telemetry || data.latest?.recorded_at || data.device?.last_seen_at || null);
+    setLastMeasuredAt(data.last_measured_at || data.latest?.measured_at || data.device?.last_measured_at || null);
 
     if (data.sensor_health) {
       setSensorHealth(data.sensor_health);
@@ -85,6 +98,15 @@ export default function DashboardPage() {
         adxl345: !data.is_online ? 'no_data' : (data.latest?.rms_z_g !== null && data.latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
         motor_temp: !data.is_online ? 'no_data' : (data.latest?.motor_temp_c !== null && data.latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
         ambient_temp: !data.is_online ? 'no_data' : (data.latest?.ambient_temp_c !== null && data.latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+        sd_card: data.latest?.sd_card_status ?? data.device?.sd_card_status ?? 'not_initialized',
+        rtc: {
+          status: data.latest?.rtc_status ?? data.device?.rtc_status ?? 'not_detected',
+          synced: Boolean(data.latest?.rtc_synced),
+        },
+        offline_queue: {
+          unsynced_count: data.latest?.unsynced_records_count ?? data.device?.unsynced_records_count ?? 0,
+          oldest_timestamp: data.latest?.oldest_unsynced_timestamp ?? null,
+        },
       });
     }
   };
@@ -156,6 +178,13 @@ export default function DashboardPage() {
   const i2cErrors = latest?.i2c_errors !== null && latest?.i2c_errors !== undefined ? String(latest.i2c_errors) : (isOnline ? '0' : null);
   const missedSlots = latest?.missed_sample_slots !== null && latest?.missed_sample_slots !== undefined ? String(latest.missed_sample_slots) : (isOnline ? '0' : null);
 
+  const sdCardState: SdCardState = (sensorHealth.sd_card || latest?.sd_card_status || device?.sd_card_status || 'not_initialized') as SdCardState;
+  const rtcState: RtcState = (sensorHealth.rtc?.status || latest?.rtc_status || device?.rtc_status || 'not_detected') as RtcState;
+  const rtcSynced = Boolean(sensorHealth.rtc?.synced || latest?.rtc_synced);
+  const unsyncedCount = sensorHealth.offline_queue?.unsynced_count ?? latest?.unsynced_records_count ?? device?.unsynced_records_count ?? 0;
+  const oldestPendingTimestamp = sensorHealth.offline_queue?.oldest_timestamp ?? latest?.oldest_unsynced_timestamp ?? null;
+  const measuredAt = latest?.measured_at || lastMeasuredAt || null;
+
   const motorSensorState: SensorState = isMotorCurrentAndValid
     ? 'ready'
     : (!isOnline || isStale)
@@ -217,6 +246,63 @@ export default function DashboardPage() {
     }
   };
 
+  const getSdBadgeVariant = (state: SdCardState, unsynced: number) => {
+    switch (state) {
+      case 'ready':
+        return unsynced > 0 ? 'warning' : 'online';
+      case 'full':
+      case 'write_error':
+      case 'missing':
+        return 'offline';
+      case 'not_initialized':
+      default:
+        return 'neutral';
+    }
+  };
+
+  const getSdLabel = (state: SdCardState, unsynced: number) => {
+    switch (state) {
+      case 'ready':
+        return unsynced > 0 ? `Buffering (${unsynced})` : 'Logging OK';
+      case 'full':
+        return 'Card Full';
+      case 'missing':
+        return 'Card Missing';
+      case 'write_error':
+        return 'Write Error';
+      case 'not_initialized':
+      default:
+        return 'Not Mounted';
+    }
+  };
+
+  const getRtcBadgeVariant = (state: RtcState, synced: boolean) => {
+    switch (state) {
+      case 'ready':
+        return synced ? 'online' : 'stale';
+      case 'time_lost':
+        return 'warning';
+      case 'invalid_time':
+      case 'not_detected':
+      default:
+        return 'offline';
+    }
+  };
+
+  const getRtcLabel = (state: RtcState, synced: boolean) => {
+    switch (state) {
+      case 'ready':
+        return synced ? 'NTP Synced' : 'RTC Running';
+      case 'time_lost':
+        return 'Battery Lost';
+      case 'invalid_time':
+        return 'Invalid Time';
+      case 'not_detected':
+      default:
+        return 'Not Detected';
+    }
+  };
+
   return (
     <div>
       <Header
@@ -249,7 +335,7 @@ export default function DashboardPage() {
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
             {/* 1. ESP32 / Device Connection */}
             <Card id="status-card-esp32" className="py-3 px-4 flex flex-col justify-between">
               <div className="flex items-center justify-between">
@@ -364,13 +450,57 @@ export default function DashboardPage() {
               </span>
             </Card>
 
-            {/* 6. Last Successful Telemetry */}
+            {/* 6. MicroSD Offline Storage */}
+            <Card id="status-card-sdcard" className="py-3 px-4 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                  MicroSD Buffer
+                </span>
+                <HardDrive className="w-4 h-4 text-amber-400" />
+              </div>
+              <div className="my-2">
+                <Badge
+                  id="badge-status-sdcard"
+                  variant={getSdBadgeVariant(sdCardState, unsyncedCount)}
+                  dot
+                >
+                  {getSdLabel(sdCardState, unsyncedCount)}
+                </Badge>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono block">
+                {sdCardState === 'ready' ? (unsyncedCount > 0 ? `${unsyncedCount} unsynced` : 'Queue Synced') : 'SPI FSPI'}
+              </span>
+            </Card>
+
+            {/* 7. DS3231 RTC Clock */}
+            <Card id="status-card-rtc" className="py-3 px-4 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                  DS3231 RTC
+                </span>
+                <Clock className="w-4 h-4 text-indigo-400" />
+              </div>
+              <div className="my-2">
+                <Badge
+                  id="badge-status-rtc"
+                  variant={getRtcBadgeVariant(rtcState, rtcSynced)}
+                  dot
+                >
+                  {getRtcLabel(rtcState, rtcSynced)}
+                </Badge>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono block">
+                {rtcState === 'ready' ? (rtcSynced ? 'I2C 0x68 (NTP Valid)' : 'I2C 0x68 (Local RTC)') : 'I2C 0x68 Missing'}
+              </span>
+            </Card>
+
+            {/* 8. Last Successful Telemetry */}
             <Card id="status-card-last-telemetry" className="py-3 px-4 flex flex-col justify-between">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
                   Last Telemetry
                 </span>
-                <Clock className="w-4 h-4 text-emerald-400" />
+                <Activity className="w-4 h-4 text-emerald-400" />
               </div>
               <div className="my-2">
                 <span className="text-xs font-mono font-bold text-slate-200 block truncate">
@@ -581,7 +711,7 @@ export default function DashboardPage() {
             <span className="text-xs text-slate-500 font-mono">200 Hz Sampling Cadence</span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <MetricCard
               id="metric-sample-count"
               title="Window Sample Count"
@@ -617,7 +747,7 @@ export default function DashboardPage() {
               unit="err"
               subValue={
                 isOnline
-                  ? Number(i2cErrors) === 0 ? "Clean communication with ADXL345" : "I2C bus retries occurred"
+                  ? Number(i2cErrors) === 0 ? "Clean communication with ADXL345 & DS3231" : "I2C bus retries occurred"
                   : "No recent telemetry"
               }
               status={isStale ? 'stale' : Number(i2cErrors) > 0 ? 'warning' : 'normal'}
@@ -637,6 +767,38 @@ export default function DashboardPage() {
               status={isStale ? 'stale' : Number(missedSlots) > 0 ? 'warning' : 'normal'}
               sensorState={isOnline && !isStale ? (Number(missedSlots) > 0 ? 'error' : 'ready') : 'no_data'}
               icon={<Clock className="w-4 h-4 text-amber-400" />}
+            />
+            <MetricCard
+              id="metric-queue-depth"
+              title="MicroSD Buffer Queue"
+              value={String(unsyncedCount)}
+              unit="records"
+              subValue={
+                sdCardState !== 'ready'
+                  ? `SD Card: ${getSdLabel(sdCardState, unsyncedCount)}`
+                  : unsyncedCount === 0
+                    ? "All offline records synchronized"
+                    : `Oldest pending: ${oldestPendingTimestamp ? new Date(oldestPendingTimestamp).toLocaleTimeString() : 'In queue'}`
+              }
+              status={unsyncedCount > 0 ? 'warning' : 'normal'}
+              sensorState={sdCardState === 'ready' ? 'ready' : 'no_data'}
+              icon={<HardDrive className="w-4 h-4 text-amber-400" />}
+            />
+            <MetricCard
+              id="metric-measurement-time"
+              title="Physical Sample Time (RTC)"
+              value={measuredAt ? new Date(measuredAt).toLocaleTimeString() : '--:--:--'}
+              unit=""
+              subValue={
+                rtcState === 'ready'
+                  ? rtcSynced
+                    ? "DS3231 (NTP synchronized)"
+                    : "DS3231 (RTC hardware time)"
+                  : "RTC not detected on I2C"
+              }
+              status={rtcState === 'ready' ? 'normal' : 'warning'}
+              sensorState={rtcState === 'ready' ? 'ready' : 'no_data'}
+              icon={<Clock className="w-4 h-4 text-indigo-400" />}
             />
           </div>
         </div>

@@ -1,4 +1,6 @@
 export type SensorState = 'ready' | 'not_detected' | 'error' | 'no_data';
+export type SdCardState = 'ready' | 'missing' | 'full' | 'write_error' | 'not_initialized';
+export type RtcState = 'ready' | 'not_detected' | 'invalid_time' | 'time_lost';
 
 export interface SensorStatusMap {
   adxl345?: SensorState;
@@ -8,6 +10,8 @@ export interface SensorStatusMap {
 
 export interface TelemetryPayload {
   device_id: string;
+  record_id?: string | null;
+  measured_at?: string | null; // ISO 8601 physical measurement timestamp from DS3231 RTC
   motor_temp_c?: number | null;
   ambient_temp_c?: number | null;
   ax_g?: number | null;
@@ -23,6 +27,11 @@ export interface TelemetryPayload {
   sensor_status?: SensorStatusMap;
   i2c_errors?: number | null;
   missed_sample_slots?: number | null;
+  sd_card_status?: SdCardState | null;
+  unsynced_records_count?: number | null;
+  oldest_unsynced_timestamp?: string | null;
+  rtc_status?: RtcState | null;
+  rtc_synced?: boolean | null;
 }
 
 export interface TelemetryRecord extends TelemetryPayload {
@@ -40,6 +49,10 @@ export interface DeviceRecord {
   last_seen_at: string | null;
   wifi_rssi_dbm?: number | null;
   sensor_status?: SensorStatusMap;
+  sd_card_status?: SdCardState | null;
+  rtc_status?: RtcState | null;
+  unsynced_records_count?: number | null;
+  last_measured_at?: string | null;
   created_at: string;
   updated_at: string;
 }

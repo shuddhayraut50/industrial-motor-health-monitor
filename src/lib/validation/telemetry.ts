@@ -117,6 +117,50 @@ export const TelemetryPayloadSchema = z.object({
     .max(100000)
     .nullable()
     .optional(),
+
+  record_id: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-zA-Z0-9_\-:]+$/, 'record_id contains invalid characters')
+    .nullable()
+    .optional(),
+
+  measured_at: z
+    .string()
+    .datetime({ offset: true })
+    .nullable()
+    .optional(),
+
+  sd_card_status: z
+    .enum(['ready', 'missing', 'full', 'write_error', 'not_initialized'])
+    .nullable()
+    .optional(),
+
+  unsynced_records_count: z
+    .number()
+    .int()
+    .min(0)
+    .max(1000000)
+    .nullable()
+    .optional(),
+
+  oldest_unsynced_timestamp: z
+    .string()
+    .datetime({ offset: true })
+    .nullable()
+    .optional(),
+
+  rtc_status: z
+    .enum(['ready', 'not_detected', 'invalid_time', 'time_lost'])
+    .nullable()
+    .optional(),
+
+  rtc_synced: z
+    .boolean()
+    .nullable()
+    .optional(),
 });
 
 export type ValidatedTelemetryPayload = z.infer<typeof TelemetryPayloadSchema>;
+

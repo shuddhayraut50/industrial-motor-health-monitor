@@ -158,6 +158,25 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
   const admin = getAdminClient();
   const recordedAt = record.recorded_at || new Date().toISOString();
 
+  // Idempotency: If record_id is provided, check if it was already inserted
+  if (record.record_id) {
+    if (admin) {
+      const { data: existing } = await admin
+        .from('telemetry')
+        .select('*')
+        .eq('record_id', record.record_id)
+        .maybeSingle();
+      if (existing) {
+        return existing as TelemetryRecord;
+      }
+    } else {
+      const existing = mockDb.telemetry.find((t) => t.record_id === record.record_id);
+      if (existing) {
+        return existing;
+      }
+    }
+  }
+
   if (admin) {
     // 1. Ensure device exists in devices table & record heartbeat and sensor status
     const devUpsert: Record<string, unknown> = {
@@ -172,12 +191,24 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.wifi_rssi_dbm !== undefined) {
       devUpsert.wifi_rssi_dbm = record.wifi_rssi_dbm;
     }
+    if (record.sd_card_status) {
+      devUpsert.sd_card_status = record.sd_card_status;
+    }
+    if (record.rtc_status) {
+      devUpsert.rtc_status = record.rtc_status;
+    }
+    if (record.unsynced_records_count !== undefined) {
+      devUpsert.unsynced_records_count = record.unsynced_records_count;
+    }
+    if (record.measured_at) {
+      devUpsert.last_measured_at = record.measured_at;
+    }
 
     const { error: devError } = await admin
       .from('devices')
       .upsert(devUpsert, { onConflict: 'device_id' });
 
-    // Fallback if sensor_status or wifi_rssi_dbm columns don't exist yet on remote table
+    // Fallback if newer columns don't exist yet on remote table
     if (devError && (devError.message.includes('column') || devError.code === '42703')) {
       await admin.from('devices').upsert(
         {
@@ -206,6 +237,12 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
       sample_count: record.sample_count ?? null,
       acquisition_quality: record.acquisition_quality ?? null,
     };
+    if (record.record_id) {
+      telemetryInsertPayload.record_id = record.record_id;
+    }
+    if (record.measured_at) {
+      telemetryInsertPayload.measured_at = record.measured_at;
+    }
     if (record.wifi_rssi_dbm !== undefined) {
       telemetryInsertPayload.wifi_rssi_dbm = record.wifi_rssi_dbm;
     }
@@ -218,6 +255,21 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.missed_sample_slots !== undefined) {
       telemetryInsertPayload.missed_sample_slots = record.missed_sample_slots;
     }
+    if (record.sd_card_status) {
+      telemetryInsertPayload.sd_card_status = record.sd_card_status;
+    }
+    if (record.unsynced_records_count !== undefined) {
+      telemetryInsertPayload.unsynced_records_count = record.unsynced_records_count;
+    }
+    if (record.oldest_unsynced_timestamp) {
+      telemetryInsertPayload.oldest_unsynced_timestamp = record.oldest_unsynced_timestamp;
+    }
+    if (record.rtc_status) {
+      telemetryInsertPayload.rtc_status = record.rtc_status;
+    }
+    if (record.rtc_synced !== undefined) {
+      telemetryInsertPayload.rtc_synced = record.rtc_synced;
+    }
 
     let { data, error } = await admin
       .from('telemetry')
@@ -225,8 +277,27 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
       .select()
       .single();
 
+    // Idempotency: Duplicate record_id race handling
+    if (error && (error.code === '23505' || error.message.includes('duplicate key') || error.message.includes('unique constraint'))) {
+      if (record.record_id) {
+        const { data: existing } = await admin
+          .from('telemetry')
+          .select('*')
+          .eq('record_id', record.record_id)
+          .maybeSingle();
+        if (existing) return existing as TelemetryRecord;
+      }
+    }
+
     // If remote table doesn't have the new columns yet, retry without them
     if (error && (error.message.includes('column') || error.code === '42703')) {
+      delete telemetryInsertPayload.record_id;
+      delete telemetryInsertPayload.measured_at;
+      delete telemetryInsertPayload.sd_card_status;
+      delete telemetryInsertPayload.unsynced_records_count;
+      delete telemetryInsertPayload.oldest_unsynced_timestamp;
+      delete telemetryInsertPayload.rtc_status;
+      delete telemetryInsertPayload.rtc_synced;
       delete telemetryInsertPayload.wifi_rssi_dbm;
       delete telemetryInsertPayload.sensor_status;
       delete telemetryInsertPayload.i2c_errors;
@@ -242,7 +313,7 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
 
     if (error && (error.code === '23502' || error.message.includes('not-null constraint'))) {
       console.warn(
-        `[DB_MIGRATION_PENDING] Live Supabase database requires migration 00003 to allow NULL columns for disconnected sensors: ${error.message}. Telemetry cached in store.`
+        `[DB_MIGRATION_PENDING] Live Supabase database requires migration to allow NULL columns for disconnected sensors: ${error.message}. Telemetry cached in store.`
       );
       // Fall through to update mockDb store so telemetry is preserved and API succeeds with 201
     } else if (error) {
@@ -259,6 +330,10 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     dev.updated_at = recordedAt;
     if (record.sensor_status) dev.sensor_status = record.sensor_status;
     if (record.wifi_rssi_dbm !== undefined) dev.wifi_rssi_dbm = record.wifi_rssi_dbm;
+    if (record.sd_card_status) dev.sd_card_status = record.sd_card_status;
+    if (record.rtc_status) dev.rtc_status = record.rtc_status;
+    if (record.unsynced_records_count !== undefined) dev.unsynced_records_count = record.unsynced_records_count;
+    if (record.measured_at) dev.last_measured_at = record.measured_at;
   } else {
     mockDb.devices.set(record.device_id, {
       id: `dev-${Date.now()}`,
@@ -269,6 +344,10 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
       last_seen_at: recordedAt,
       wifi_rssi_dbm: record.wifi_rssi_dbm ?? null,
       sensor_status: record.sensor_status,
+      sd_card_status: record.sd_card_status ?? 'not_initialized',
+      rtc_status: record.rtc_status ?? 'not_detected',
+      unsynced_records_count: record.unsynced_records_count ?? 0,
+      last_measured_at: record.measured_at ?? null,
       created_at: recordedAt,
       updated_at: recordedAt,
     });
@@ -278,8 +357,12 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     ...record,
     id: mockDb.telemetry.length + 1,
     recorded_at: recordedAt,
+    measured_at: record.measured_at || recordedAt,
     i2c_errors: record.i2c_errors ?? 0,
     missed_sample_slots: record.missed_sample_slots ?? 0,
+    sd_card_status: record.sd_card_status ?? 'not_initialized',
+    rtc_status: record.rtc_status ?? 'not_detected',
+    unsynced_records_count: record.unsynced_records_count ?? 0,
   };
 
   mockDb.telemetry.push(newRecord);
@@ -296,6 +379,9 @@ export async function getLiveTelemetry(
     (t) => t.device_id === deviceId && new Date(t.recorded_at).getTime() >= new Date(sinceTime).getTime()
   );
 
+  const sortByTime = (a: TelemetryRecord, b: TelemetryRecord) =>
+    new Date(a.measured_at || a.recorded_at).getTime() - new Date(b.measured_at || b.recorded_at).getTime();
+
   if (admin) {
     const { data, error } = await admin
       .from('telemetry')
@@ -308,16 +394,16 @@ export async function getLiveTelemetry(
     if (!error && data) {
       if (mockRecords.length > 0) {
         const combined = [...data, ...mockRecords];
-        return combined.sort((a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime());
+        return combined.sort(sortByTime);
       }
-      return data as TelemetryRecord[];
+      return (data as TelemetryRecord[]).sort(sortByTime);
     } else if (mockRecords.length > 0) {
-      return mockRecords.sort((a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime());
+      return mockRecords.sort(sortByTime);
     }
   }
 
   // Mock store
-  return mockRecords.sort((a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime());
+  return mockRecords.sort(sortByTime);
 }
 
 export async function getHistoricalTelemetry(
@@ -327,6 +413,8 @@ export async function getHistoricalTelemetry(
   limit: number = 500
 ): Promise<TelemetryRecord[]> {
   const admin = getAdminClient();
+  const sortByTime = (a: TelemetryRecord, b: TelemetryRecord) =>
+    new Date(a.measured_at || a.recorded_at).getTime() - new Date(b.measured_at || b.recorded_at).getTime();
 
   if (admin) {
     let query = admin
@@ -346,7 +434,7 @@ export async function getHistoricalTelemetry(
       .limit(limit);
 
     if (!error && data) {
-      return (data as TelemetryRecord[]).reverse();
+      return (data as TelemetryRecord[]).sort(sortByTime);
     }
   }
 
@@ -361,7 +449,7 @@ export async function getHistoricalTelemetry(
   }
 
   return records
-    .sort((a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime())
+    .sort(sortByTime)
     .slice(-limit);
 }
 

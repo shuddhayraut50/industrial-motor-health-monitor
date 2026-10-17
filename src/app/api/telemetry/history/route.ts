@@ -16,7 +16,9 @@ export async function GET(request: NextRequest) {
     if (format === 'csv') {
       const headers = [
         'id',
+        'record_id',
         'device_id',
+        'measured_at',
         'recorded_at',
         'motor_temp_c',
         'ambient_temp_c',
@@ -27,6 +29,12 @@ export async function GET(request: NextRequest) {
         'rms_x_g',
         'rms_y_g',
         'rms_z_g',
+        'sample_count',
+        'acquisition_quality',
+        'i2c_errors',
+        'missed_sample_slots',
+        'sd_card_status',
+        'rtc_status',
         'firmware_version',
       ];
 
@@ -45,7 +53,9 @@ export async function GET(request: NextRequest) {
         csvRows.push(
           [
             r.id,
+            `"${r.record_id || ''}"`,
             `"${r.device_id}"`,
+            `"${r.measured_at || r.recorded_at}"`,
             `"${r.recorded_at}"`,
             r.motor_temp_c ?? '',
             r.ambient_temp_c ?? '',
@@ -56,6 +66,12 @@ export async function GET(request: NextRequest) {
             r.rms_x_g ?? '',
             r.rms_y_g ?? '',
             r.rms_z_g ?? '',
+            r.sample_count ?? '',
+            r.acquisition_quality ?? '',
+            r.i2c_errors ?? 0,
+            r.missed_sample_slots ?? 0,
+            `"${r.sd_card_status || 'not_initialized'}"`,
+            `"${r.rtc_status || 'not_detected'}"`,
             `"${r.firmware_version || 'unknown'}"`,
           ].join(',')
         );

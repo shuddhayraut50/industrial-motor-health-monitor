@@ -247,6 +247,55 @@ describe('TelemetryPayloadSchema validation', () => {
     const result = TelemetryPayloadSchema.safeParse(invalidDiagnostics);
     expect(result.success).toBe(false);
   });
+
+  it('accepts telemetry with record_id, measured_at, sd_card_status, and rtc_status', () => {
+    const withOfflineAndRtc = {
+      device_id: 'motor-monitor-001',
+      record_id: 'rec-motor-monitor-001-1729177200-42',
+      measured_at: '2026-10-17T10:00:00.000Z',
+      motor_temp_c: 35.0,
+      ambient_temp_c: 24.5,
+      ax_g: 0.01,
+      ay_g: -0.04,
+      az_g: 0.99,
+      rms_x_g: 0.005,
+      rms_y_g: 0.006,
+      rms_z_g: 0.008,
+      sd_card_status: 'ready',
+      unsynced_records_count: 5,
+      oldest_unsynced_timestamp: '2026-10-17T09:55:00.000Z',
+      rtc_status: 'ready',
+      rtc_synced: true,
+    };
+
+    const result = TelemetryPayloadSchema.safeParse(withOfflineAndRtc);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.record_id).toBe('rec-motor-monitor-001-1729177200-42');
+      expect(result.data.sd_card_status).toBe('ready');
+      expect(result.data.rtc_status).toBe('ready');
+      expect(result.data.rtc_synced).toBe(true);
+      expect(result.data.unsynced_records_count).toBe(5);
+    }
+  });
+
+  it('rejects invalid record_id with forbidden special characters', () => {
+    const unsafeRecordId = {
+      device_id: 'motor-monitor-001',
+      record_id: 'rec-001; DROP TABLE telemetry;--',
+      motor_temp_c: 35.0,
+      ambient_temp_c: 24.5,
+      ax_g: 0.01,
+      ay_g: -0.04,
+      az_g: 0.99,
+      rms_x_g: 0.005,
+      rms_y_g: 0.006,
+      rms_z_g: 0.008,
+    };
+
+    const result = TelemetryPayloadSchema.safeParse(unsafeRecordId);
+    expect(result.success).toBe(false);
+  });
 });
 
 describe('DeviceConfigUpdateSchema validation', () => {
