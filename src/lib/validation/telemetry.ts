@@ -82,15 +82,17 @@ export const TelemetryPayloadSchema = z.object({
   acquisition_quality: z
     .number()
     .min(0)
-    .max(1)
+    .max(1.1)
+    .transform((val) => Math.min(1.0, Math.max(0.0, val)))
     .nullable()
     .optional(),
 
   wifi_rssi_dbm: z
     .number()
     .int()
-    .min(-140)
-    .max(0)
+    .min(-160)
+    .max(20)
+    .transform((val) => (val > 0 ? null : val))
     .nullable()
     .optional(),
 
@@ -100,6 +102,7 @@ export const TelemetryPayloadSchema = z.object({
       motor_temp: z.enum(['ready', 'not_detected', 'error', 'no_data']).optional(),
       ambient_temp: z.enum(['ready', 'not_detected', 'error', 'no_data']).optional(),
     })
+    .nullable()
     .optional(),
 
   i2c_errors: z
@@ -127,10 +130,14 @@ export const TelemetryPayloadSchema = z.object({
     .optional(),
 
   measured_at: z
-    .string()
-    .datetime({ offset: true })
-    .nullable()
-    .optional(),
+    .preprocess((val) => {
+      if (typeof val === 'string') {
+        const trimmed = val.trim();
+        if (trimmed === '' || isNaN(Date.parse(trimmed))) return null;
+        return trimmed;
+      }
+      return val;
+    }, z.string().datetime({ offset: true }).nullable().optional()),
 
   sd_card_status: z
     .enum(['ready', 'missing', 'full', 'write_error', 'not_initialized'])

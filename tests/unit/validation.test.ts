@@ -248,6 +248,40 @@ describe('TelemetryPayloadSchema validation', () => {
     expect(result.success).toBe(false);
   });
 
+  it('resiliently handles empty or invalid measured_at strings by converting to null', () => {
+    const withEmptyDate = {
+      device_id: 'motor-monitor-001',
+      measured_at: '',
+    };
+    const res1 = TelemetryPayloadSchema.safeParse(withEmptyDate);
+    expect(res1.success).toBe(true);
+    if (res1.success) expect(res1.data.measured_at).toBeNull();
+
+    const withInvalidDate = {
+      device_id: 'motor-monitor-001',
+      measured_at: 'not-a-valid-date',
+    };
+    const res2 = TelemetryPayloadSchema.safeParse(withInvalidDate);
+    expect(res2.success).toBe(true);
+    if (res2.success) expect(res2.data.measured_at).toBeNull();
+  });
+
+  it('resiliently clamps acquisition_quality slightly above 1.0 and handles anomalous positive RSSI', () => {
+    const edgeTelemetry = {
+      device_id: 'motor-monitor-001',
+      acquisition_quality: 1.002,
+      wifi_rssi_dbm: 1,
+      sensor_status: null,
+    };
+    const res = TelemetryPayloadSchema.safeParse(edgeTelemetry);
+    expect(res.success).toBe(true);
+    if (res.success) {
+      expect(res.data.acquisition_quality).toBe(1.0);
+      expect(res.data.wifi_rssi_dbm).toBeNull();
+      expect(res.data.sensor_status).toBeNull();
+    }
+  });
+
   it('accepts telemetry with record_id, measured_at, sd_card_status, and rtc_status', () => {
     const withOfflineAndRtc = {
       device_id: 'motor-monitor-001',

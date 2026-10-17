@@ -1270,11 +1270,15 @@ int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
     responseBody = http.getString();
     Serial.printf("[TELEMETRY] HTTP %d (Upload: %lu ms)\n",
                   httpCode, (unsigned long)((esp_timer_get_time() - uploadStartUs) / 1000));
+    if (httpCode != 200 && httpCode != 201) {
+      Serial.printf("[TELEMETRY-ERROR] %s\n", responseBody.c_str());
+    }
   } else {
     responseBody = http.errorToString(httpCode);
     Serial.printf("[TELEMETRY] FAILED: %s\n", responseBody.c_str());
   }
   http.end();
+  client.stop();
 
   perfMetrics.lastUploadDurationMs = (uint32_t)((esp_timer_get_time() - uploadStartUs) / 1000);
   return httpCode;
@@ -1299,6 +1303,7 @@ int sendDiagnosticEventPayload(const String &jsonPayload) {
     Serial.printf("[EVENT-UPLOAD] FAILED: %s\n", http.errorToString(httpCode).c_str());
   }
   http.end();
+  client.stop();
   return httpCode;
 }
 
@@ -1423,6 +1428,7 @@ void processEventsQueue() {
   if (WiFi.status() != WL_CONNECTED) return;
   uint32_t now = millis();
   if (now - diagTracker.lastEventSyncMs < 4000) return;
+  if (now - lastSuccessfulUploadMs < 1500) return;
   diagTracker.lastEventSyncMs = now;
 
   // Process SD card events first
@@ -1438,7 +1444,7 @@ void processEventsQueue() {
           entry.close();
 
           int code = sendDiagnosticEventPayload(content);
-          if (code >= 200 && code < 300) {
+          if ((code >= 200 && code < 300) || (code >= 400 && code < 500)) {
             SD.remove(filepath.c_str());
             count++;
           } else {
@@ -1467,7 +1473,7 @@ void processEventsQueue() {
           entry.close();
 
           int code = sendDiagnosticEventPayload(content);
-          if (code >= 200 && code < 300) {
+          if ((code >= 200 && code < 300) || (code >= 400 && code < 500)) {
             LittleFS.remove(filepath.c_str());
             count++;
           } else {
@@ -1519,6 +1525,7 @@ void sendDeviceCommandAck(const char *commandId, const char *status, const char 
   serializeJson(ackDoc, ackPayload);
   http.POST(ackPayload);
   http.end();
+  client.stop();
 }
 
 void pollDeviceCommands() {
@@ -1629,12 +1636,14 @@ void pollDeviceCommands() {
     }
   }
   http.end();
+  client.stop();
 }
 
 void processBacklogQueue() {
   if (WiFi.status() != WL_CONNECTED) return;
   uint32_t now = millis();
   if (now < nextBacklogUploadAttemptMs) return;
+  if (now - lastSuccessfulUploadMs < 2000) return;
 
   if (sdCardReady) {
     File dir = SD.open("/queue");
@@ -1657,6 +1666,12 @@ void processBacklogQueue() {
       String resStr;
       int httpCode = sendTelemetryPayload(content, resStr);
       if (httpCode >= 200 && httpCode < 300) {
+        SD.remove(path.c_str());
+        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+        nextBacklogUploadAttemptMs = now + 400;
+        return;
+      } else if (httpCode >= 400 && httpCode < 500) {
+        Serial.printf("[QUEUE] Discarding unrecoverable record %s (HTTP %d): %s\n", path.c_str(), httpCode, resStr.c_str());
         SD.remove(path.c_str());
         if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
         nextBacklogUploadAttemptMs = now + 400;
@@ -1687,6 +1702,12 @@ void processBacklogQueue() {
       String resStr;
       int httpCode = sendTelemetryPayload(content, resStr);
       if (httpCode >= 200 && httpCode < 300) {
+        LittleFS.remove(path.c_str());
+        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+        nextBacklogUploadAttemptMs = now + 400;
+        return;
+      } else if (httpCode >= 400 && httpCode < 500) {
+        Serial.printf("[QUEUE] Discarding unrecoverable record %s (HTTP %d): %s\n", path.c_str(), httpCode, resStr.c_str());
         LittleFS.remove(path.c_str());
         if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
         nextBacklogUploadAttemptMs = now + 400;
@@ -1723,6 +1744,7 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   else doc["measured_at"] = nullptr;
 
   int wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -120;
+  if (wifiRssi > 0) wifiRssi = -120;
   if (WiFi.status() == WL_CONNECTED) doc["wifi_rssi_dbm"] = wifiRssi;
   else doc["wifi_rssi_dbm"] = nullptr;
 
@@ -1736,11 +1758,11 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
     doc["ax_g"] = snap.meanX;
     doc["ay_g"] = snap.meanY;
     doc["az_g"] = snap.meanZ;
-    doc["rms_x_g"] = snap.rmsX;
-    doc["rms_y_g"] = snap.rmsY;
-    doc["rms_z_g"] = snap.rmsZ;
+    doc["rms_x_g"] = fmaxf(0.0f, snap.rmsX);
+    doc["rms_y_g"] = fmaxf(0.0f, snap.rmsY);
+    doc["rms_z_g"] = fmaxf(0.0f, snap.rmsZ);
     doc["sample_count"] = snap.sampleCount;
-    doc["acquisition_quality"] = snap.acquisitionQuality;
+    doc["acquisition_quality"] = fmaxf(0.0f, fminf(1.0f, snap.acquisitionQuality));
   } else {
     doc["ax_g"] = nullptr;
     doc["ay_g"] = nullptr;
@@ -1781,8 +1803,8 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
 
   bool synced = false;
 
-  // Direct upload if online and no backlog
-  if (WiFi.status() == WL_CONNECTED && unsyncedRecordsCount == 0) {
+  // Direct upload of live telemetry snapshot whenever Wi-Fi is connected
+  if (WiFi.status() == WL_CONNECTED) {
     String responseStr;
     int httpCode = sendTelemetryPayload(payload, responseStr);
     if (httpCode >= 200 && httpCode < 300) {
@@ -1904,8 +1926,8 @@ void loop() {
     }
   }
 
-  // Periodic Two-Way Command Polling from Web Dashboard (every 5 seconds)
-  if (now - lastCommandPollMs >= 5000) {
+  // Periodic Two-Way Command Polling from Web Dashboard (every 5 seconds, staggered from telemetry)
+  if (now - lastCommandPollMs >= 5000 && (now - lastSuccessfulUploadMs >= 2000)) {
     lastCommandPollMs = now;
     pollDeviceCommands();
   }

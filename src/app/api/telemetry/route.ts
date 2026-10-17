@@ -40,6 +40,7 @@ export async function POST(request: NextRequest) {
     const parseResult = TelemetryPayloadSchema.safeParse(rawBody);
     if (!parseResult.success) {
       const issueMessages = parseResult.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`);
+      console.warn(`[TELEMETRY_VALIDATION_ERROR] Device: ${(rawBody as Record<string, unknown>)?.device_id}`, issueMessages, JSON.stringify(rawBody));
       return NextResponse.json(
         { error: 'Validation Error', details: issueMessages },
         { status: 400 }
