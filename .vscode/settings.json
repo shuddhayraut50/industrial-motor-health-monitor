@@ -3,7 +3,8 @@
     "*.ino": "cpp"
   },
   "clangd.fallbackFlags": [
-    "-xc++",
+    "-x",
+    "c++",
     "-std=gnu++17",
     "-DESP32",
     "-DESP32S3"

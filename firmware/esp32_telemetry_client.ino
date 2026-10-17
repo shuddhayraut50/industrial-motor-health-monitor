@@ -25,8 +25,8 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 
 #ifndef SERVER_TELEMETRY_URL
 // Live Ingestion Endpoint (HTTPS)
-const char *SERVER_TELEMETRY_URL =
-    "https://industrial-motor-health-monitor.vercel.app/api/telemetry";
+#define SERVER_TELEMETRY_URL \
+    "https://industrial-motor-health-monitor.vercel.app/api/telemetry"
 #endif
 
 // Device Identification
@@ -196,7 +196,7 @@ bool readAcceleration(float &xG, float &yG, float &zG) {
 // ==============================================================================
 void vibrationSamplingTask(void *parameter) {
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t periodTicks = pdMS_TO_TICKS(5); // 5ms = 200 Hz
+  const TickType_t periodTicks = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1; // 5ms = 200 Hz
 
   for (;;) {
     if (adxlReady) {
@@ -301,7 +301,7 @@ void updateTemperatures() {
         motorTempValid = true;
       } else {
         motorTempValid = false;
-        Serial.printf("[DS18B20] ERROR: Motor probe read failed (val: %.1f°C). Marking unavailable.\n", t);
+        Serial.printf("[DS18B20] ERROR: Motor probe read failed (val: %.1f C). Marking unavailable.\n", t);
       }
     } else {
       motorTempValid = false;
@@ -314,7 +314,7 @@ void updateTemperatures() {
         ambientTempValid = true;
       } else {
         ambientTempValid = false;
-        Serial.printf("[DS18B20] ERROR: Ambient probe read failed (val: %.1f°C). Marking unavailable.\n", t);
+        Serial.printf("[DS18B20] ERROR: Ambient probe read failed (val: %.1f C). Marking unavailable.\n", t);
       }
     } else {
       ambientTempValid = false;
@@ -447,7 +447,11 @@ bool uploadTelemetry(
   }
 
   // 4. Structured Independent Sensor Status
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonObject sensorStatus = doc["sensor_status"].to<JsonObject>();
+#else
   JsonObject sensorStatus = doc.createNestedObject("sensor_status");
+#endif
   sensorStatus["adxl345"] = hasVibration ? "ready" : (adxlError ? "error" : "not_detected");
   sensorStatus["motor_temp"] = hasMotorTemp ? "ready" : (motorProbeFound ? "error" : "not_detected");
   sensorStatus["ambient_temp"] = hasAmbientTemp ? "ready" : (ambientProbeFound ? "error" : "not_detected");
@@ -462,10 +466,10 @@ bool uploadTelemetry(
     char ambStr[16];
     char rmsStr[32];
 
-    if (hasMotorTemp) snprintf(motorStr, sizeof(motorStr), "%.1f°C", motorTemp);
+    if (hasMotorTemp) snprintf(motorStr, sizeof(motorStr), "%.1f C", motorTemp);
     else snprintf(motorStr, sizeof(motorStr), "null");
 
-    if (hasAmbientTemp) snprintf(ambStr, sizeof(ambStr), "%.1f°C", ambientTemp);
+    if (hasAmbientTemp) snprintf(ambStr, sizeof(ambStr), "%.1f C", ambientTemp);
     else snprintf(ambStr, sizeof(ambStr), "null");
 
     if (hasVibration) snprintf(rmsStr, sizeof(rmsStr), "(%.3f, %.3f, %.3f)g", rmsX, rmsY, rmsZ);
