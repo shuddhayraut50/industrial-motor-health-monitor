@@ -68,6 +68,11 @@ export async function GET(request: NextRequest) {
     const sanitizedRssi = isValidRssi ? rawRssi : null;
 
     // Independent sensor health statuses
+    const effectiveSensorStatus = latest?.sensor_status ?? device?.sensor_status ?? null;
+    const hasLatestAdxl = latest?.rms_z_g !== null && latest?.rms_z_g !== undefined;
+    const hasLatestMotor = latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined;
+    const hasLatestAmbient = latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined;
+
     const sensorHealth = {
       esp32: isOnline ? 'online' : (isStale ? 'stale' : 'offline'),
       wifi: isOnline
@@ -78,18 +83,18 @@ export async function GET(request: NextRequest) {
       adxl345: !isOnline && !isStale
         ? 'no_data'
         : isStale
-        ? (latest?.sensor_status?.adxl345 === 'ready' ? 'cached' : latest?.sensor_status?.adxl345 ?? 'not_detected')
-        : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
+        ? (effectiveSensorStatus?.adxl345 === 'ready' || hasLatestAdxl ? 'cached' : effectiveSensorStatus?.adxl345 ?? 'not_detected')
+        : (effectiveSensorStatus?.adxl345 ?? (hasLatestAdxl ? 'ready' : 'not_detected')),
       motor_temp: !isOnline && !isStale
         ? 'no_data'
         : isStale
-        ? (latest?.sensor_status?.motor_temp === 'ready' ? 'cached' : latest?.sensor_status?.motor_temp ?? 'not_detected')
-        : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
+        ? (effectiveSensorStatus?.motor_temp === 'ready' || hasLatestMotor ? 'cached' : effectiveSensorStatus?.motor_temp ?? 'not_detected')
+        : (effectiveSensorStatus?.motor_temp ?? (hasLatestMotor ? 'ready' : 'not_detected')),
       ambient_temp: !isOnline && !isStale
         ? 'no_data'
         : isStale
-        ? (latest?.sensor_status?.ambient_temp === 'ready' ? 'cached' : latest?.sensor_status?.ambient_temp ?? 'not_detected')
-        : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+        ? (effectiveSensorStatus?.ambient_temp === 'ready' || hasLatestAmbient ? 'cached' : effectiveSensorStatus?.ambient_temp ?? 'not_detected')
+        : (effectiveSensorStatus?.ambient_temp ?? (hasLatestAmbient ? 'ready' : 'not_detected')),
       sd_card: storageDiagnostics.sd_card_status,
       storage_medium: storageDiagnostics.medium,
       rtc: {

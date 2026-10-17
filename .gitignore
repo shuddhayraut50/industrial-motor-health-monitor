@@ -50,3 +50,6 @@ next-env.d.ts
 firmware/secrets.h
 firmware/compile_flags.txt
 .clangd
+
+# graphify
+graphify-out/

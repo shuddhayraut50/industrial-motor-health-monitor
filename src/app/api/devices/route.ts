@@ -29,6 +29,11 @@ export async function GET() {
           isStale = ageSeconds > gracePeriodSec && ageSeconds <= stalePeriodSec;
         }
 
+        const effectiveSensorStatus = latest?.sensor_status ?? dev?.sensor_status ?? null;
+        const hasLatestAdxl = latest?.rms_z_g !== null && latest?.rms_z_g !== undefined;
+        const hasLatestMotor = latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined;
+        const hasLatestAmbient = latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined;
+
         const sensorHealth = {
           esp32: isOnline ? 'online' : (isStale ? 'stale' : 'offline'),
           wifi: isOnline || isStale
@@ -36,13 +41,13 @@ export async function GET() {
             : { status: 'offline', rssi_dbm: null },
           adxl345: !isOnline && !isStale
             ? 'no_data'
-            : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
+            : (effectiveSensorStatus?.adxl345 ?? (hasLatestAdxl ? 'ready' : 'not_detected')),
           motor_temp: !isOnline && !isStale
             ? 'no_data'
-            : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
+            : (effectiveSensorStatus?.motor_temp ?? (hasLatestMotor ? 'ready' : 'not_detected')),
           ambient_temp: !isOnline && !isStale
             ? 'no_data'
-            : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
+            : (effectiveSensorStatus?.ambient_temp ?? (hasLatestAmbient ? 'ready' : 'not_detected')),
         };
 
         return {

@@ -127,6 +127,7 @@ uint32_t lastTempRequestMs = 0;
 uint32_t lastWiFiAttemptMs = 0;
 uint32_t wifiBackoffMs = 5000;
 uint32_t lastRediscoveryMs = 0;
+uint32_t lastSdRetryMs = 0;
 uint32_t lastNtpAttemptMs = 0;
 uint32_t lastCommandPollMs = 0;
 uint32_t lastPerfLogMs = 0;
@@ -913,6 +914,11 @@ void scanOfflineQueue() {
 }
 
 bool initialiseLittleFSFallback() {
+  if (littleFsReady) {
+    storageUsedPct = calculateStorageUsage(LittleFS.totalBytes(), LittleFS.usedBytes());
+    storageMedium = "flash_littlefs";
+    return true;
+  }
   if (LittleFS.begin(true)) {
     littleFsReady = true;
     storageUsedPct = calculateStorageUsage(LittleFS.totalBytes(), LittleFS.usedBytes());
@@ -942,7 +948,7 @@ bool initialiseSDCard(bool verbose = true) {
       diagTracker.lastSdState = "missing";
       logDiagnosticEvent("sd_card", "SD_CARD_MISSING", "warning", prevState.c_str(), "missing", "MicroSD mount failed on CS; LittleFS flash buffer active", nullptr, false);
     }
-    initialiseLittleFSFallback();
+    if (!littleFsReady) initialiseLittleFSFallback();
     scanOfflineQueue();
     return false;
   }
@@ -956,7 +962,7 @@ bool initialiseSDCard(bool verbose = true) {
       diagTracker.lastSdState = "missing";
       logDiagnosticEvent("sd_card", "SD_CARD_MISSING", "warning", prevState.c_str(), "missing", "MicroSD card not detected in slot; LittleFS flash buffer active", nullptr, false);
     }
-    initialiseLittleFSFallback();
+    if (!littleFsReady) initialiseLittleFSFallback();
     scanOfflineQueue();
     return false;
   }
@@ -1191,7 +1197,11 @@ void checkSensorRecovery() {
   if (!adxlReady) initialiseADXL345(false);
   if (!rtcReady) initialiseDS3231(false);
   if (!motorProbeFound || !ambientProbeFound) discoverTemperatureProbes(false);
-  if (!sdCardReady) initialiseSDCard(false);
+  // Re-probe SD card only every 120s if missing to prevent SPI bus mount timeout freezes
+  if (!sdCardReady && (now - lastSdRetryMs >= 120000)) {
+    lastSdRetryMs = now;
+    initialiseSDCard(false);
+  }
 }
 
 // ==============================================================================
@@ -1258,8 +1268,11 @@ int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
   int httpCode = http.POST(jsonPayload);
   if (httpCode > 0) {
     responseBody = http.getString();
+    Serial.printf("[TELEMETRY] HTTP %d (Upload: %lu ms)\n",
+                  httpCode, (unsigned long)((esp_timer_get_time() - uploadStartUs) / 1000));
   } else {
     responseBody = http.errorToString(httpCode);
+    Serial.printf("[TELEMETRY] FAILED: %s\n", responseBody.c_str());
   }
   http.end();
 
@@ -1280,6 +1293,11 @@ int sendDiagnosticEventPayload(const String &jsonPayload) {
   http.setTimeout(3500);
 
   int httpCode = http.POST(jsonPayload);
+  if (httpCode > 0) {
+    Serial.printf("[EVENT-UPLOAD] HTTP %d\n", httpCode);
+  } else {
+    Serial.printf("[EVENT-UPLOAD] FAILED: %s\n", http.errorToString(httpCode).c_str());
+  }
   http.end();
   return httpCode;
 }
@@ -1327,8 +1345,24 @@ void logDiagnosticEvent(
   String timestamp = getRtcIsoTimestamp();
   const char *tsSource = "rtc";
   if (timestamp.length() == 0) {
+    time_t now = time(nullptr);
+    if (now > 1735689600) {
+      struct tm *tm_info = gmtime(&now);
+      if (tm_info) {
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
+        timestamp = String(buf);
+        tsSource = "system";
+      }
+    }
+  }
+  if (timestamp.length() == 0) {
+    uint32_t s = millis() / 1000;
+    uint32_t mins = (s / 60) % 60;
+    uint32_t secs = s % 60;
+    uint32_t hrs = (s / 3600) % 24;
     char buf[32];
-    snprintf(buf, sizeof(buf), "1970-01-01T00:00:%02luZ", (unsigned long)(millis() / 1000));
+    snprintf(buf, sizeof(buf), "2026-01-01T%02u:%02u:%02uZ", hrs, mins, secs);
     timestamp = String(buf);
     tsSource = "system";
   } else if (rtcSynced) {
@@ -1803,7 +1837,7 @@ void setup() {
 
   // 2. Initialise Mutexes and Realtime Telemetry Queue
   i2cMutex = xSemaphoreCreateMutex();
-  telemetrySnapshotQueue = xQueueCreate(4, sizeof(TelemetrySnapshot));
+  telemetrySnapshotQueue = xQueueCreate(8, sizeof(TelemetrySnapshot));
 
   // 3. Initialise I2C Bus for ADXL345 & DS3231 RTC
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);

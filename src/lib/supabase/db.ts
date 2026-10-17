@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getAdminClient } from './admin';
 import { TelemetryRecord, DeviceRecord, TelemetryStats, DeviceConnectionStatus } from '../types/telemetry';
 import { DeviceConfig, DeviceConfigAck } from '../types/config';
@@ -7,6 +8,14 @@ import {
   CommandAckRequest,
 } from '../types/commands';
 import { DeviceDiagnosticEvent, DiagnosticEventsFilter } from '../types/events';
+
+export function toDeterministicUuid(str: string): string {
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)) {
+    return str;
+  }
+  const hex = crypto.createHash('md5').update(str).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 
 // In-memory test store used for local testing, CI, and Playwright verification
 class MockDatabaseStore {
@@ -504,6 +513,18 @@ export async function getLiveTelemetry(
       .limit(1000);
 
     if (!error && data) {
+      if (data.length === 0 && mockRecords.length === 0) {
+        // Fallback: Fetch the single most recent record so dashboard always has the latest known reading
+        const { data: fallbackLatest } = await admin
+          .from('telemetry')
+          .select('*')
+          .eq('device_id', deviceId)
+          .order('recorded_at', { ascending: false })
+          .limit(1);
+        if (fallbackLatest && fallbackLatest.length > 0) {
+          return fallbackLatest as TelemetryRecord[];
+        }
+      }
       if (mockRecords.length > 0) {
         const combined = [...data, ...mockRecords];
         return combined.sort(sortByTime);
@@ -515,6 +536,12 @@ export async function getLiveTelemetry(
   }
 
   // Mock store
+  if (mockRecords.length === 0) {
+    const lastMock = mockDb.telemetry
+      .filter((t) => t.device_id === deviceId)
+      .sort((a, b) => new Date(b.recorded_at).getTime() - new Date(a.recorded_at).getTime())[0];
+    if (lastMock) return [lastMock];
+  }
   return mockRecords.sort(sortByTime);
 }
 
@@ -1026,21 +1053,33 @@ export async function insertDiagnosticEventsBatch(
 
   if (admin) {
     try {
-      const recordsToInsert = events.map((e) => ({
-        id: e.id,
-        device_id: e.device_id,
-        component: e.component,
-        event_code: e.event_code,
-        severity: e.severity,
-        previous_state: e.previous_state ?? null,
-        new_state: e.new_state,
-        event_timestamp: e.event_timestamp,
-        timestamp_source: e.timestamp_source ?? 'system',
-        diagnostic_message: e.diagnostic_message,
-        details: e.details ?? {},
-        firmware_version: e.firmware_version ?? null,
-        resolved: e.resolved ?? false,
-      }));
+      const recordsToInsert = events.map((e) => {
+        let validTimestamp = e.event_timestamp;
+        try {
+          const parsed = new Date(e.event_timestamp);
+          if (isNaN(parsed.getTime())) {
+            validTimestamp = new Date().toISOString();
+          }
+        } catch {
+          validTimestamp = new Date().toISOString();
+        }
+
+        return {
+          id: toDeterministicUuid(e.id),
+          device_id: e.device_id,
+          component: e.component,
+          event_code: e.event_code,
+          severity: e.severity,
+          previous_state: e.previous_state ?? null,
+          new_state: e.new_state,
+          event_timestamp: validTimestamp,
+          timestamp_source: e.timestamp_source ?? 'system',
+          diagnostic_message: e.diagnostic_message,
+          details: e.details ?? {},
+          firmware_version: e.firmware_version ?? null,
+          resolved: e.resolved ?? false,
+        };
+      });
 
       const { data, error } = await admin
         .from('device_diagnostic_events')
