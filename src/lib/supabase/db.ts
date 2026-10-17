@@ -1,6 +1,11 @@
 import { getAdminClient } from './admin';
-import { TelemetryRecord, DeviceRecord, TelemetryStats } from '../types/telemetry';
+import { TelemetryRecord, DeviceRecord, TelemetryStats, DeviceConnectionStatus } from '../types/telemetry';
 import { DeviceConfig, DeviceConfigAck } from '../types/config';
+import {
+  DeviceCommandRecord,
+  CreateCommandRequest,
+  CommandAckRequest,
+} from '../types/commands';
 
 // In-memory test store used for local testing, CI, and Playwright verification
 class MockDatabaseStore {
@@ -8,6 +13,7 @@ class MockDatabaseStore {
   telemetry: TelemetryRecord[] = [];
   configs: Map<string, DeviceConfig[]> = new Map();
   acks: Map<string, DeviceConfigAck[]> = new Map();
+  commands: DeviceCommandRecord[] = [];
 
   constructor() {
     this.seedDefault();
@@ -18,6 +24,7 @@ class MockDatabaseStore {
     this.telemetry = [];
     this.configs.clear();
     this.acks.clear();
+    this.commands = [];
 
     const now = new Date();
     // Default prototype device
@@ -90,6 +97,7 @@ class MockDatabaseStore {
     this.telemetry = [];
     this.configs.clear();
     this.acks.clear();
+    this.commands = [];
   }
 }
 
@@ -203,6 +211,21 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.measured_at) {
       devUpsert.last_measured_at = record.measured_at;
     }
+    if (record.condition_status) {
+      devUpsert.condition_status = record.condition_status;
+    }
+    if (record.condition_reason) {
+      devUpsert.condition_reason = record.condition_reason;
+    }
+    if (record.storage_medium) {
+      devUpsert.storage_medium = record.storage_medium;
+    }
+    if (record.storage_used_pct !== undefined) {
+      devUpsert.storage_used_pct = record.storage_used_pct;
+    }
+    if (record.dropped_records_count !== undefined) {
+      devUpsert.dropped_records_count = record.dropped_records_count;
+    }
 
     const { error: devError } = await admin
       .from('devices')
@@ -270,6 +293,21 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.rtc_synced !== undefined) {
       telemetryInsertPayload.rtc_synced = record.rtc_synced;
     }
+    if (record.condition_status) {
+      telemetryInsertPayload.condition_status = record.condition_status;
+    }
+    if (record.condition_reason) {
+      telemetryInsertPayload.condition_reason = record.condition_reason;
+    }
+    if (record.storage_medium) {
+      telemetryInsertPayload.storage_medium = record.storage_medium;
+    }
+    if (record.storage_used_pct !== undefined) {
+      telemetryInsertPayload.storage_used_pct = record.storage_used_pct;
+    }
+    if (record.dropped_records_count !== undefined) {
+      telemetryInsertPayload.dropped_records_count = record.dropped_records_count;
+    }
 
     let { data, error } = await admin
       .from('telemetry')
@@ -302,6 +340,11 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
       delete telemetryInsertPayload.sensor_status;
       delete telemetryInsertPayload.i2c_errors;
       delete telemetryInsertPayload.missed_sample_slots;
+      delete telemetryInsertPayload.condition_status;
+      delete telemetryInsertPayload.condition_reason;
+      delete telemetryInsertPayload.storage_medium;
+      delete telemetryInsertPayload.storage_used_pct;
+      delete telemetryInsertPayload.dropped_records_count;
       const retry = await admin
         .from('telemetry')
         .insert(telemetryInsertPayload)
@@ -334,6 +377,11 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     if (record.rtc_status) dev.rtc_status = record.rtc_status;
     if (record.unsynced_records_count !== undefined) dev.unsynced_records_count = record.unsynced_records_count;
     if (record.measured_at) dev.last_measured_at = record.measured_at;
+    if (record.condition_status) dev.condition_status = record.condition_status;
+    if (record.condition_reason) dev.condition_reason = record.condition_reason;
+    if (record.storage_medium) dev.storage_medium = record.storage_medium;
+    if (record.storage_used_pct !== undefined) dev.storage_used_pct = record.storage_used_pct;
+    if (record.dropped_records_count !== undefined) dev.dropped_records_count = record.dropped_records_count;
   } else {
     mockDb.devices.set(record.device_id, {
       id: `dev-${Date.now()}`,
@@ -348,6 +396,11 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
       rtc_status: record.rtc_status ?? 'not_detected',
       unsynced_records_count: record.unsynced_records_count ?? 0,
       last_measured_at: record.measured_at ?? null,
+      condition_status: record.condition_status ?? null,
+      condition_reason: record.condition_reason ?? null,
+      storage_medium: record.storage_medium ?? null,
+      storage_used_pct: record.storage_used_pct ?? null,
+      dropped_records_count: record.dropped_records_count ?? 0,
       created_at: recordedAt,
       updated_at: recordedAt,
     });
@@ -363,6 +416,11 @@ export async function insertTelemetry(record: Omit<TelemetryRecord, 'id'>): Prom
     sd_card_status: record.sd_card_status ?? 'not_initialized',
     rtc_status: record.rtc_status ?? 'not_detected',
     unsynced_records_count: record.unsynced_records_count ?? 0,
+    condition_status: record.condition_status ?? null,
+    condition_reason: record.condition_reason ?? null,
+    storage_medium: record.storage_medium ?? null,
+    storage_used_pct: record.storage_used_pct ?? null,
+    dropped_records_count: record.dropped_records_count ?? 0,
   };
 
   mockDb.telemetry.push(newRecord);
@@ -655,3 +713,235 @@ export async function getLatestDeviceAck(deviceId: string): Promise<DeviceConfig
   const list = mockDb.acks.get(deviceId) || [];
   return list.length > 0 ? list[list.length - 1] : null;
 }
+
+/**
+ * Strict server-side connection status calculation.
+ * Distinguishes ONLINE, STALE, OFFLINE, NEVER_CONNECTED based on real last_seen_at.
+ */
+export function calculateDeviceConnectionStatus(
+  device: DeviceRecord | null,
+  options?: { nowMs?: number; onlineThresholdMs?: number; staleThresholdMs?: number }
+): DeviceConnectionStatus {
+  if (!device || !device.last_seen_at) return 'NEVER_CONNECTED';
+  const lastSeenMs = new Date(device.last_seen_at).getTime();
+  if (isNaN(lastSeenMs)) return 'NEVER_CONNECTED';
+  const nowMs = options?.nowMs ?? Date.now();
+  const ageMs = nowMs - lastSeenMs;
+  if (ageMs < 0) return 'ONLINE'; // minor clock skew tolerance
+  const onlineThresholdMs = options?.onlineThresholdMs ?? 25000; // 25s (approx 5 reporting cycles)
+  const staleThresholdMs = options?.staleThresholdMs ?? 120000; // 2 minutes
+  if (ageMs <= onlineThresholdMs) return 'ONLINE';
+  if (ageMs <= staleThresholdMs) return 'STALE';
+  return 'OFFLINE';
+}
+
+/**
+ * Creates a new device command and enqueues it.
+ */
+export async function createDeviceCommand(
+  req: CreateCommandRequest,
+  requestedBy: string = 'dashboard'
+): Promise<DeviceCommandRecord> {
+  const admin = getAdminClient();
+  const now = new Date();
+  const expiresInSec = req.expires_in_seconds ?? 300;
+  const expiresAt = new Date(now.getTime() + expiresInSec * 1000).toISOString();
+
+  if (admin) {
+    const { data, error } = await admin
+      .from('device_commands')
+      .insert({
+        device_id: req.device_id,
+        command_type: req.command_type,
+        parameters: req.parameters || {},
+        status: 'QUEUED',
+        requested_by: requestedBy,
+        created_at: now.toISOString(),
+        expires_at: expiresAt,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.warn(`[SUPABASE_COMMAND_FALLBACK] Failed to insert to device_commands table: ${error.message}. Storing in mock.`);
+    } else if (data) {
+      return data as DeviceCommandRecord;
+    }
+  }
+
+  // Fallback to in-memory store
+  const id = `cmd-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  const cmdRecord: DeviceCommandRecord = {
+    id,
+    device_id: req.device_id,
+    command_type: req.command_type,
+    parameters: req.parameters || {},
+    status: 'QUEUED',
+    requested_by: requestedBy,
+    created_at: now.toISOString(),
+    expires_at: expiresAt,
+  };
+  mockDb.commands.push(cmdRecord);
+  return cmdRecord;
+}
+
+/**
+ * Retrieves pending commands for an authenticated ESP32 device, advances their status to DELIVERED.
+ */
+export async function getPendingDeviceCommands(deviceId: string): Promise<DeviceCommandRecord[]> {
+  const admin = getAdminClient();
+  const nowIso = new Date().toISOString();
+
+  if (admin) {
+    try {
+      // Expire overdue commands first
+      await admin
+        .from('device_commands')
+        .update({ status: 'EXPIRED' })
+        .eq('device_id', deviceId)
+        .in('status', ['CREATED', 'QUEUED', 'DELIVERED'])
+        .lt('expires_at', nowIso);
+
+      // Fetch queued commands
+      const { data, error } = await admin
+        .from('device_commands')
+        .select('*')
+        .eq('device_id', deviceId)
+        .in('status', ['CREATED', 'QUEUED'])
+        .gt('expires_at', nowIso)
+        .order('created_at', { ascending: true })
+        .limit(5);
+
+      if (!error && data && data.length > 0) {
+        // Mark as DELIVERED
+        const ids = data.map((c) => c.id);
+        await admin
+          .from('device_commands')
+          .update({ status: 'DELIVERED', delivered_at: nowIso })
+          .in('id', ids);
+
+        return data.map((c) => ({ ...c, status: 'DELIVERED', delivered_at: nowIso })) as DeviceCommandRecord[];
+      }
+    } catch (e) {
+      console.warn(`[SUPABASE_COMMAND_POLL_FALLBACK] Error polling device_commands: ${e}. Using mock store.`);
+    }
+  }
+
+  // Fallback to in-memory store
+  const nowMs = Date.now();
+  mockDb.commands.forEach((c) => {
+    if (c.device_id === deviceId && ['CREATED', 'QUEUED', 'DELIVERED'].includes(c.status)) {
+      if (new Date(c.expires_at).getTime() < nowMs) {
+        c.status = 'EXPIRED';
+      }
+    }
+  });
+
+  const pending = mockDb.commands.filter(
+    (c) =>
+      c.device_id === deviceId &&
+      ['CREATED', 'QUEUED'].includes(c.status) &&
+      new Date(c.expires_at).getTime() >= nowMs
+  );
+
+  pending.forEach((c) => {
+    c.status = 'DELIVERED';
+    c.delivered_at = nowIso;
+  });
+
+  return pending;
+}
+
+/**
+ * Acknowledges or updates execution status of a device command.
+ */
+export async function acknowledgeDeviceCommand(
+  ack: CommandAckRequest
+): Promise<DeviceCommandRecord | null> {
+  const admin = getAdminClient();
+  const nowIso = new Date().toISOString();
+
+  if (admin) {
+    try {
+      const updatePayload: Record<string, unknown> = {
+        status: ack.status,
+      };
+      if (ack.status === 'ACKNOWLEDGED' || ack.status === 'EXECUTING') {
+        updatePayload.acknowledged_at = nowIso;
+      }
+      if (ack.status === 'SUCCEEDED' || ack.status === 'FAILED') {
+        updatePayload.completed_at = nowIso;
+        updatePayload.acknowledged_at = nowIso;
+      }
+      if (ack.result !== undefined) {
+        updatePayload.result = ack.result;
+      }
+      if (ack.error_message !== undefined) {
+        updatePayload.error_message = ack.error_message;
+      }
+
+      const { data, error } = await admin
+        .from('device_commands')
+        .update(updatePayload)
+        .eq('id', ack.command_id)
+        .select()
+        .maybeSingle();
+
+      if (!error && data) {
+        return data as DeviceCommandRecord;
+      }
+    } catch (e) {
+      console.warn(`[SUPABASE_COMMAND_ACK_FALLBACK] Error acking command: ${e}. Updating mock store.`);
+    }
+  }
+
+  // Fallback to in-memory store
+  const found = mockDb.commands.find((c) => c.id === ack.command_id);
+  if (found) {
+    found.status = ack.status;
+    if (ack.status === 'ACKNOWLEDGED' || ack.status === 'EXECUTING') {
+      if (!found.acknowledged_at) found.acknowledged_at = nowIso;
+    }
+    if (ack.status === 'SUCCEEDED' || ack.status === 'FAILED') {
+      found.completed_at = nowIso;
+      if (!found.acknowledged_at) found.acknowledged_at = nowIso;
+    }
+    if (ack.result !== undefined) found.result = ack.result;
+    if (ack.error_message !== undefined) found.error_message = ack.error_message;
+    return found;
+  }
+  return null;
+}
+
+/**
+ * Retrieves the command execution history for a device.
+ */
+export async function getDeviceCommandsHistory(
+  deviceId: string,
+  limit: number = 20
+): Promise<DeviceCommandRecord[]> {
+  const admin = getAdminClient();
+
+  if (admin) {
+    try {
+      const { data, error } = await admin
+        .from('device_commands')
+        .select('*')
+        .eq('device_id', deviceId)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (!error && data) {
+        return data as DeviceCommandRecord[];
+      }
+    } catch (e) {
+      console.warn(`[SUPABASE_COMMAND_HISTORY_FALLBACK] Error fetching command history: ${e}. Using mock store.`);
+    }
+  }
+
+  return mockDb.commands
+    .filter((c) => c.device_id === deviceId)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, limit);
+}
+

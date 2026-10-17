@@ -104,6 +104,10 @@ export async function POST(request: NextRequest) {
         sensor_status: savedRecord.sensor_status ?? null,
         sd_card_status: savedRecord.sd_card_status ?? null,
         rtc_status: savedRecord.rtc_status ?? null,
+        condition_status: savedRecord.condition_status ?? null,
+        condition_reason: savedRecord.condition_reason ?? null,
+        storage_medium: savedRecord.storage_medium ?? null,
+        storage_used_pct: savedRecord.storage_used_pct ?? null,
       },
       {
         status: 201,

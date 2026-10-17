@@ -128,6 +128,39 @@ export default function HistoryPage() {
               <Filter className="w-3.5 h-3.5 mr-1" />
               Apply Filter
             </Button>
+
+            {/* Quick 12h / 24h Window Presets */}
+            <div className="flex items-center gap-1.5 ml-2 border-l border-slate-800 pl-3">
+              <span className="text-[11px] text-slate-500 uppercase font-semibold">Presets:</span>
+              <button
+                id="preset-12h-btn"
+                type="button"
+                onClick={() => {
+                  const now = new Date();
+                  const start = new Date(now.getTime() - 12 * 3600 * 1000);
+                  setStartDate(start.toISOString().slice(0, 16));
+                  setEndDate(now.toISOString().slice(0, 16));
+                  fetchHistory();
+                }}
+                className="px-2.5 py-1 text-xs rounded-md bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors"
+              >
+                Last 12h
+              </button>
+              <button
+                id="preset-24h-btn"
+                type="button"
+                onClick={() => {
+                  const now = new Date();
+                  const start = new Date(now.getTime() - 24 * 3600 * 1000);
+                  setStartDate(start.toISOString().slice(0, 16));
+                  setEndDate(now.toISOString().slice(0, 16));
+                  fetchHistory();
+                }}
+                className="px-2.5 py-1 text-xs rounded-md bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors"
+              >
+                Last 24h
+              </button>
+            </div>
           </div>
 
           <div className="flex items-center gap-3">

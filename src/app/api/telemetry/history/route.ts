@@ -35,6 +35,11 @@ export async function GET(request: NextRequest) {
         'missed_sample_slots',
         'sd_card_status',
         'rtc_status',
+        'condition_status',
+        'condition_reason',
+        'storage_medium',
+        'storage_used_pct',
+        'dropped_records_count',
         'firmware_version',
       ];
 
@@ -72,6 +77,11 @@ export async function GET(request: NextRequest) {
             r.missed_sample_slots ?? 0,
             `"${r.sd_card_status || 'not_initialized'}"`,
             `"${r.rtc_status || 'not_detected'}"`,
+            `"${r.condition_status || 'UNKNOWN'}"`,
+            `"${(r.condition_reason || '').replace(/"/g, '""')}"`,
+            `"${r.storage_medium || 'none'}"`,
+            r.storage_used_pct ?? '',
+            r.dropped_records_count ?? 0,
             `"${r.firmware_version || 'unknown'}"`,
           ].join(',')
         );

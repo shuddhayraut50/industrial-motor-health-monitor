@@ -160,6 +160,37 @@ export const TelemetryPayloadSchema = z.object({
     .boolean()
     .nullable()
     .optional(),
+
+  condition_status: z
+    .enum(['GOOD', 'CHECK', 'WARNING', 'CRITICAL', 'UNKNOWN'])
+    .nullable()
+    .optional(),
+
+  condition_reason: z
+    .string()
+    .max(256)
+    .nullable()
+    .optional(),
+
+  storage_medium: z
+    .enum(['sd_card', 'flash_littlefs', 'none', 'error'])
+    .nullable()
+    .optional(),
+
+  storage_used_pct: z
+    .number()
+    .min(0)
+    .max(100)
+    .nullable()
+    .optional(),
+
+  dropped_records_count: z
+    .number()
+    .int()
+    .min(0)
+    .max(10000000)
+    .nullable()
+    .optional(),
 });
 
 export type ValidatedTelemetryPayload = z.infer<typeof TelemetryPayloadSchema>;

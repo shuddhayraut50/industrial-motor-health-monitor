@@ -2,6 +2,10 @@ export type SensorState = 'ready' | 'not_detected' | 'error' | 'no_data';
 export type SdCardState = 'ready' | 'missing' | 'full' | 'write_error' | 'not_initialized';
 export type RtcState = 'ready' | 'not_detected' | 'invalid_time' | 'time_lost';
 
+export type ConditionStatus = 'GOOD' | 'CHECK' | 'WARNING' | 'CRITICAL' | 'UNKNOWN';
+export type StorageMedium = 'sd_card' | 'flash_littlefs' | 'none' | 'error';
+export type DeviceConnectionStatus = 'ONLINE' | 'STALE' | 'OFFLINE' | 'API_ERROR' | 'NEVER_CONNECTED';
+
 export interface SensorStatusMap {
   adxl345?: SensorState;
   motor_temp?: SensorState;
@@ -32,6 +36,12 @@ export interface TelemetryPayload {
   oldest_unsynced_timestamp?: string | null;
   rtc_status?: RtcState | null;
   rtc_synced?: boolean | null;
+  // Local condition classification and storage hierarchy diagnostics
+  condition_status?: ConditionStatus | null;
+  condition_reason?: string | null;
+  storage_medium?: StorageMedium | null;
+  storage_used_pct?: number | null;
+  dropped_records_count?: number | null;
 }
 
 export interface TelemetryRecord extends TelemetryPayload {
@@ -53,11 +63,16 @@ export interface DeviceRecord {
   rtc_status?: RtcState | null;
   unsynced_records_count?: number | null;
   last_measured_at?: string | null;
+  condition_status?: ConditionStatus | null;
+  condition_reason?: string | null;
+  storage_medium?: StorageMedium | null;
+  storage_used_pct?: number | null;
+  dropped_records_count?: number | null;
   created_at: string;
   updated_at: string;
 }
 
-export type TimeWindow = '1m' | '5m' | '15m' | '60m' | '24h' | 'custom';
+export type TimeWindow = '1m' | '5m' | '15m' | '60m' | '12h' | '24h' | 'custom';
 
 export interface TelemetryStats {
   sample_count: number;

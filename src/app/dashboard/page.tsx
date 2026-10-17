@@ -19,7 +19,9 @@ import {
   HardDrive,
 } from 'lucide-react';
 import Link from 'next/link';
-import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState } from '@/lib/types/telemetry';
+import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState, ConditionStatus, StorageMedium } from '@/lib/types/telemetry';
+import { SimpleMotorView } from '@/components/dashboard/SimpleMotorView';
+import { LedCommandCenter } from '@/components/dashboard/LedCommandCenter';
 
 export default function DashboardPage() {
   const [deviceId, setDeviceId] = useState(() => {
@@ -29,6 +31,29 @@ export default function DashboardPage() {
     }
     return 'motor-monitor-001';
   });
+
+  const [dashboardMode, setDashboardMode] = useState<'simple' | 'technical'>(() => {
+    if (typeof window !== 'undefined') {
+      const urlParams = new URLSearchParams(window.location.search);
+      const modeParam = urlParams.get('mode');
+      if (modeParam === 'simple' || modeParam === 'technical') {
+        return modeParam;
+      }
+      const saved = localStorage.getItem('dashboard_mode');
+      if (saved === 'simple' || saved === 'technical') {
+        return saved;
+      }
+    }
+    return 'technical';
+  });
+
+  const handleModeChange = (mode: 'simple' | 'technical') => {
+    setDashboardMode(mode);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('dashboard_mode', mode);
+    }
+  };
+
   const [device, setDevice] = useState<DeviceRecord | null>(null);
   const [latest, setLatest] = useState<TelemetryRecord | null>(null);
   const [isOnline, setIsOnline] = useState(false);
@@ -39,6 +64,11 @@ export default function DashboardPage() {
   const [lastSynced, setLastSynced] = useState<string | null>(null);
   const [lastSuccessfulTelemetry, setLastSuccessfulTelemetry] = useState<string | null>(null);
   const [lastMeasuredAt, setLastMeasuredAt] = useState<string | null>(null);
+  const [conditionStatus, setConditionStatus] = useState<ConditionStatus>('UNKNOWN');
+  const [conditionReason, setConditionReason] = useState<string>('Initial evaluation pending');
+  const [storageMedium, setStorageMedium] = useState<StorageMedium>('none');
+  const [storageUsedPct, setStorageUsedPct] = useState<number>(0);
+  const [droppedRecordsCount, setDroppedRecordsCount] = useState<number>(0);
   const [sensorHealth, setSensorHealth] = useState<{
     esp32: 'online' | 'stale' | 'offline';
     wifi: { status: 'connected' | 'offline'; rssi_dbm: number | null };
@@ -66,6 +96,16 @@ export default function DashboardPage() {
     is_stale: boolean;
     age_seconds: number | null;
     config_version: number;
+    condition_status?: ConditionStatus | null;
+    condition_reason?: string | null;
+    storage_diagnostics?: {
+      medium?: StorageMedium;
+      used_pct?: number;
+      dropped_records_count?: number;
+      sd_card_status?: SdCardState;
+      unsynced_records_count?: number;
+      oldest_unsynced_timestamp?: string | null;
+    };
     sensor_health?: {
       esp32: 'online' | 'stale' | 'offline';
       wifi: { status: 'connected' | 'offline'; rssi_dbm: number | null };
@@ -88,6 +128,12 @@ export default function DashboardPage() {
     setLastSynced(new Date().toISOString());
     setLastSuccessfulTelemetry(data.last_successful_telemetry || data.latest?.recorded_at || data.device?.last_seen_at || null);
     setLastMeasuredAt(data.last_measured_at || data.latest?.measured_at || data.device?.last_measured_at || null);
+
+    setConditionStatus(data.condition_status || data.latest?.condition_status || data.device?.condition_status || 'UNKNOWN');
+    setConditionReason(data.condition_reason || data.latest?.condition_reason || data.device?.condition_reason || 'Initial baseline');
+    setStorageMedium(data.storage_diagnostics?.medium || data.latest?.storage_medium || data.device?.storage_medium || 'none');
+    setStorageUsedPct(data.storage_diagnostics?.used_pct ?? data.latest?.storage_used_pct ?? data.device?.storage_used_pct ?? 0);
+    setDroppedRecordsCount(data.storage_diagnostics?.dropped_records_count ?? data.latest?.dropped_records_count ?? data.device?.dropped_records_count ?? 0);
 
     if (data.sensor_health) {
       setSensorHealth(data.sensor_health);
@@ -316,6 +362,49 @@ export default function DashboardPage() {
       />
 
       <div className="p-6 max-w-7xl mx-auto space-y-6">
+        {/* Simple / Technical View Switch */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+          <div className="flex items-center gap-2">
+            <span className="text-xs uppercase font-semibold text-slate-400">View Mode:</span>
+            <div className="inline-flex rounded-lg p-1 bg-slate-950 border border-slate-800" role="tablist">
+              <button
+                id="view-mode-simple-btn"
+                role="tab"
+                aria-selected={dashboardMode === 'simple'}
+                onClick={() => handleModeChange('simple')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                  dashboardMode === 'simple'
+                    ? 'bg-cyan-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Simple View (Operators)
+              </button>
+              <button
+                id="view-mode-technical-btn"
+                role="tab"
+                aria-selected={dashboardMode === 'technical'}
+                onClick={() => handleModeChange('technical')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                  dashboardMode === 'technical'
+                    ? 'bg-cyan-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Technical View (Engineers)
+              </button>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            <span className="text-slate-400 font-mono">
+              Status: <strong className="text-slate-200">{conditionStatus}</strong>
+            </span>
+            <Link href="/dashboard/history" className="text-cyan-400 hover:text-cyan-300 font-semibold flex items-center gap-1">
+              12h / 24h Trends &rarr;
+            </Link>
+          </div>
+        </div>
+
         {/* Stale or Disconnected Warning Banner */}
         <StaleWarningBanner
           isOnline={isOnline}
@@ -324,16 +413,37 @@ export default function DashboardPage() {
           lastSeenTimestamp={lastSuccessfulTelemetry}
         />
 
-        {/* Independent Hardware & Sensor Health Status Grid */}
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Hardware & Sensor Health Status
-            </h2>
-            <span className="text-[11px] text-slate-500 font-mono">
-              Independent Sensor Isolation Active
-            </span>
-          </div>
+        {dashboardMode === 'simple' ? (
+          <SimpleMotorView
+            conditionStatus={conditionStatus}
+            conditionReason={conditionReason}
+            isOnline={isOnline}
+            isStale={isStale}
+            motorTemp={motorTemp}
+            ambientTemp={ambTemp}
+            tempDiff={tempDiff}
+            rmsZ={rmsZ}
+            lastUpdated={lastSynced}
+            storageMedium={storageMedium}
+            storageUsedPct={storageUsedPct}
+            droppedRecordsCount={droppedRecordsCount}
+            unsyncedRecords={unsyncedCount}
+            motorSensorState={motorSensorState}
+            ambientSensorState={ambientSensorState}
+            adxlSensorState={adxlSensorState}
+          />
+        ) : (
+          <div className="space-y-6">
+            {/* Independent Hardware & Sensor Health Status Grid */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  Hardware & Sensor Health Status
+                </h2>
+                <span className="text-[11px] text-slate-500 font-mono">
+                  Independent Sensor Isolation Active
+                </span>
+              </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
             {/* 1. ESP32 / Device Connection */}
@@ -802,6 +912,11 @@ export default function DashboardPage() {
             />
           </div>
         </div>
+
+        {/* Section 5: Interactive Two-Way Command & LED Diagnostics */}
+        <LedCommandCenter deviceId={deviceId} isOnline={isOnline} />
+      </div>
+    )}
 
         {/* Footer Quick Action Bar */}
         <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 bg-slate-900/60 border border-slate-800 rounded-xl">

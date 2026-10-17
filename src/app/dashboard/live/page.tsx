@@ -27,6 +27,8 @@ export default function LiveMonitoringPage() {
     { label: '5 Min', value: 300 },
     { label: '15 Min', value: 900 },
     { label: '60 Min', value: 3600 },
+    { label: '12 Hours', value: 43200 },
+    { label: '24 Hours', value: 86400 },
   ];
 
   const fetchLiveData = useCallback(async (showIndicator = false) => {
