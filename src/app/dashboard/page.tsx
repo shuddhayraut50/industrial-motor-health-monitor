@@ -22,6 +22,7 @@ import Link from 'next/link';
 import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState, ConditionStatus, StorageMedium } from '@/lib/types/telemetry';
 import { SimpleMotorView } from '@/components/dashboard/SimpleMotorView';
 import { LedCommandCenter } from '@/components/dashboard/LedCommandCenter';
+import { DeviceEventsHistory } from '@/components/dashboard/DeviceEventsHistory';
 
 export default function DashboardPage() {
   const [deviceId, setDeviceId] = useState(() => {
@@ -292,13 +293,16 @@ export default function DashboardPage() {
     }
   };
 
-  const getSdBadgeVariant = (state: SdCardState, unsynced: number) => {
+  const getSdBadgeVariant = (state: SdCardState, unsynced: number, medium?: string | null) => {
+    if (state === 'ready') {
+      return unsynced > 0 ? 'warning' : 'online';
+    }
+    if (medium === 'littlefs' || state === 'missing') {
+      return 'warning';
+    }
     switch (state) {
-      case 'ready':
-        return unsynced > 0 ? 'warning' : 'online';
       case 'full':
       case 'write_error':
-      case 'missing':
         return 'offline';
       case 'not_initialized':
       default:
@@ -306,14 +310,16 @@ export default function DashboardPage() {
     }
   };
 
-  const getSdLabel = (state: SdCardState, unsynced: number) => {
+  const getSdLabel = (state: SdCardState, unsynced: number, medium?: string | null) => {
+    if (state === 'ready') {
+      return unsynced > 0 ? `Buffering (${unsynced})` : 'SD Ready';
+    }
+    if (medium === 'littlefs' || state === 'missing') {
+      return 'Flash Fallback';
+    }
     switch (state) {
-      case 'ready':
-        return unsynced > 0 ? `Buffering (${unsynced})` : 'Logging OK';
       case 'full':
         return 'Card Full';
-      case 'missing':
-        return 'Card Missing';
       case 'write_error':
         return 'Write Error';
       case 'not_initialized':
@@ -457,14 +463,18 @@ export default function DashboardPage() {
               <div className="my-2">
                 <Badge
                   id="badge-status-esp32"
-                  variant={!isOnline ? 'offline' : isStale ? 'stale' : 'online'}
+                  variant={isOnline ? 'online' : isStale ? 'stale' : 'offline'}
                   dot
                 >
-                  {!isOnline ? 'Offline' : isStale ? 'Stale' : 'Online'}
+                  {isOnline ? 'Online' : isStale ? 'Stale' : 'Offline'}
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {isOnline ? `${device?.display_name || 'Core 0/1 active'} (v${configVersion})` : 'Timeout exceeded'}
+                {isOnline
+                  ? `${device?.display_name || 'Core 0/1 active'} (v${configVersion})`
+                  : isStale
+                  ? `Delayed (${ageSeconds ?? 30}s)`
+                  : 'Offline — Timeout exceeded'}
               </span>
             </Card>
 
@@ -479,18 +489,22 @@ export default function DashboardPage() {
               <div className="my-2">
                 <Badge
                   id="badge-status-wifi"
-                  variant={sensorHealth.wifi.status === 'connected' ? 'online' : 'offline'}
+                  variant={isOnline ? 'online' : isStale ? 'stale' : 'offline'}
                   dot
                 >
-                  {sensorHealth.wifi.status === 'connected'
+                  {isOnline || isStale
                     ? sensorHealth.wifi.rssi_dbm !== null
                       ? `${sensorHealth.wifi.rssi_dbm} dBm`
-                      : 'Connected'
+                      : 'Signal N/A'
                     : 'Offline'}
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.wifi.status === 'connected' ? 'HTTPS Ingest OK' : 'No Wi-Fi Link'}
+                {isOnline
+                  ? (ageSeconds !== null && ageSeconds < 15 ? 'HTTPS Ingest OK' : `Ingest Active (${ageSeconds ?? 5}s)`)
+                  : isStale
+                  ? `Ingest Delayed (${ageSeconds ?? 30}s)`
+                  : 'Link Down / Offline'}
               </span>
             </Card>
 
@@ -512,7 +526,7 @@ export default function DashboardPage() {
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.adxl345 === 'ready' ? 'I2C 0x53 • 200 Hz' : 'I2C Not Detected'}
+                {sensorHealth.adxl345 === 'ready' ? 'I2C 0x53 • 200 Hz' : isStale ? 'Cached (Stale)' : 'I2C Not Detected'}
               </span>
             </Card>
 
@@ -534,7 +548,7 @@ export default function DashboardPage() {
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.motor_temp === 'ready' ? 'Stator (GPIO 10)' : 'Missing (GPIO 10)'}
+                {sensorHealth.motor_temp === 'ready' ? 'Stator (GPIO 10)' : isStale ? 'Cached (Stale)' : 'Missing (GPIO 10)'}
               </span>
             </Card>
 
@@ -556,7 +570,7 @@ export default function DashboardPage() {
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sensorHealth.ambient_temp === 'ready' ? 'Ambient (GPIO 11)' : 'Missing (GPIO 11)'}
+                {sensorHealth.ambient_temp === 'ready' ? 'Ambient (GPIO 11)' : isStale ? 'Cached (Stale)' : 'Missing (GPIO 11)'}
               </span>
             </Card>
 
@@ -571,14 +585,18 @@ export default function DashboardPage() {
               <div className="my-2">
                 <Badge
                   id="badge-status-sdcard"
-                  variant={getSdBadgeVariant(sdCardState, unsyncedCount)}
+                  variant={getSdBadgeVariant(sdCardState, unsyncedCount, storageMedium)}
                   dot
                 >
-                  {getSdLabel(sdCardState, unsyncedCount)}
+                  {getSdLabel(sdCardState, unsyncedCount, storageMedium)}
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
-                {sdCardState === 'ready' ? (unsyncedCount > 0 ? `${unsyncedCount} unsynced` : 'Queue Synced') : 'SPI FSPI'}
+                {sdCardState === 'ready'
+                  ? (unsyncedCount > 0 ? `${unsyncedCount} unsynced` : `SD Active (${storageUsedPct}% used)`)
+                  : (storageMedium === 'flash_littlefs' || (storageMedium as string) === 'littlefs' || sdCardState === 'missing'
+                    ? `LittleFS Flash (${storageUsedPct}% used)`
+                    : 'SPI FSPI')}
               </span>
             </Card>
 
@@ -915,6 +933,14 @@ export default function DashboardPage() {
 
         {/* Section 5: Interactive Two-Way Command & LED Diagnostics */}
         <LedCommandCenter deviceId={deviceId} isOnline={isOnline} />
+
+        {/* Section 6: Device Diagnostics & Component Event History */}
+        <DeviceEventsHistory
+          deviceId={deviceId}
+          isOnline={isOnline}
+          isStale={isStale}
+          lastSeenAt={device?.last_seen_at}
+        />
       </div>
     )}
 

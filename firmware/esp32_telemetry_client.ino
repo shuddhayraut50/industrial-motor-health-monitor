@@ -41,6 +41,11 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
     "https://industrial-motor-health-monitor.vercel.app/api/device/commands/ack"
 #endif
 
+#ifndef SERVER_EVENTS_URL
+#define SERVER_EVENTS_URL \
+    "https://industrial-motor-health-monitor.vercel.app/api/device/events"
+#endif
+
 const char *DEVICE_ID = "motor-monitor-001";
 const char *FIRMWARE_VERSION = "1.5.0-fast-rt";
 
@@ -125,6 +130,38 @@ uint32_t lastRediscoveryMs = 0;
 uint32_t lastNtpAttemptMs = 0;
 uint32_t lastCommandPollMs = 0;
 uint32_t lastPerfLogMs = 0;
+
+// Diagnostic Subsystem State Tracking
+struct DiagnosticStateTracker {
+  String lastWifiState = "disconnected";
+  String lastApiState = "healthy";
+  String lastAdxlState = "unknown";
+  String lastMotorTempState = "unknown";
+  String lastAmbientTempState = "unknown";
+  String lastSdState = "unknown";
+  String lastRtcState = "unknown";
+  String lastClassifierState = "UNKNOWN";
+
+  uint8_t wifiFailCount = 0;
+  uint8_t adxlGlitchCount = 0;
+  uint8_t motorGlitchCount = 0;
+  uint8_t ambientGlitchCount = 0;
+  uint8_t apiFailCount = 0;
+  uint32_t lastEventSyncMs = 0;
+  uint32_t eventSequence = 0;
+};
+DiagnosticStateTracker diagTracker;
+
+void logDiagnosticEvent(
+    const char *component,
+    const char *eventCode,
+    const char *severity,
+    const char *prevState,
+    const char *newState,
+    const char *diagnosticMsg,
+    const char *detailsJson = nullptr,
+    bool resolved = false
+);
 
 // ==============================================================================
 // LOW-OVERHEAD PERFORMANCE INSTRUMENTATION (esp_timer_get_time monotonic)
@@ -350,6 +387,13 @@ bool initialiseADXL345(bool verbose = true) {
     }
     adxlReady = false;
     adxlError = (deviceId != 0x00 && deviceId != 0xFF);
+    if (diagTracker.lastAdxlState != "fault") {
+      String prevState = diagTracker.lastAdxlState;
+      diagTracker.lastAdxlState = "fault";
+      char detBuf[48];
+      snprintf(detBuf, sizeof(detBuf), "{\"i2c_addr\":\"0x53\",\"dev_id\":\"0x%02X\"}", deviceId);
+      logDiagnosticEvent("adxl345", "ADXL345_NOT_RESPONDING", "error", prevState.c_str(), "fault", "ADXL345 I2C communication failed or invalid DEVID", detBuf, false);
+    }
     return false;
   }
 
@@ -364,6 +408,11 @@ bool initialiseADXL345(bool verbose = true) {
 
   adxlReady = true;
   adxlError = false;
+  if (diagTracker.lastAdxlState != "operational") {
+    String prevState = diagTracker.lastAdxlState;
+    diagTracker.lastAdxlState = "operational";
+    logDiagnosticEvent("adxl345", "ADXL345_RECOVERED", "info", prevState.c_str(), "operational", "ADXL345 accelerometer communication verified at 200 Hz", nullptr, true);
+  }
   return true;
 }
 
@@ -392,6 +441,11 @@ bool initialiseDS3231(bool verbose = true) {
     if (verbose) Serial.println("[DS3231] WARNING: RTC module not detected on I2C address 0x68.");
     rtcReady = false;
     rtcStatus = "not_detected";
+    if (diagTracker.lastRtcState != "not_detected") {
+      String prevState = diagTracker.lastRtcState;
+      diagTracker.lastRtcState = "not_detected";
+      logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "not_detected", "DS3231 RTC not detected on I2C address 0x68", nullptr, false);
+    }
     if (i2cMutex) xSemaphoreGive(i2cMutex);
     return false;
   }
@@ -420,6 +474,11 @@ bool initialiseDS3231(bool verbose = true) {
         Serial.printf("[DS3231] OK: Hardware RTC clock valid: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
                       y, mo, d, h, m, s);
       }
+      if (diagTracker.lastRtcState != "ready") {
+        String prevState = diagTracker.lastRtcState;
+        diagTracker.lastRtcState = "ready";
+        logDiagnosticEvent("rtc", "RTC_RECOVERED", "info", prevState.c_str(), "ready", "DS3231 hardware clock validated and running", nullptr, true);
+      }
       // Seed ESP32 internal system time so getRtcIsoTimestamp() requires NO I2C access
       struct tm t = {};
       t.tm_year = y - 1900;
@@ -436,6 +495,11 @@ bool initialiseDS3231(bool verbose = true) {
     } else {
       rtcReady = false;
       rtcStatus = "invalid_time";
+      if (diagTracker.lastRtcState != "invalid_time") {
+        String prevState = diagTracker.lastRtcState;
+        diagTracker.lastRtcState = "invalid_time";
+        logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "invalid_time", "DS3231 oscillator stopped or invalid date (<2025)", nullptr, false);
+      }
     }
   }
 
@@ -873,6 +937,11 @@ bool initialiseSDCard(bool verbose = true) {
     if (verbose) Serial.printf("[SD] WARNING: MicroSD mount failed on CS %d. Using LittleFS.\n", PIN_SD_CS);
     sdCardReady = false;
     sdCardStatus = "missing";
+    if (diagTracker.lastSdState != "missing") {
+      String prevState = diagTracker.lastSdState;
+      diagTracker.lastSdState = "missing";
+      logDiagnosticEvent("sd_card", "SD_CARD_MISSING", "warning", prevState.c_str(), "missing", "MicroSD mount failed on CS; LittleFS flash buffer active", nullptr, false);
+    }
     initialiseLittleFSFallback();
     scanOfflineQueue();
     return false;
@@ -882,6 +951,11 @@ bool initialiseSDCard(bool verbose = true) {
     if (verbose) Serial.println("[SD] WARNING: No card attached. Using LittleFS.");
     sdCardReady = false;
     sdCardStatus = "missing";
+    if (diagTracker.lastSdState != "missing") {
+      String prevState = diagTracker.lastSdState;
+      diagTracker.lastSdState = "missing";
+      logDiagnosticEvent("sd_card", "SD_CARD_MISSING", "warning", prevState.c_str(), "missing", "MicroSD card not detected in slot; LittleFS flash buffer active", nullptr, false);
+    }
     initialiseLittleFSFallback();
     scanOfflineQueue();
     return false;
@@ -891,6 +965,12 @@ bool initialiseSDCard(bool verbose = true) {
   sdCardStatus = "ready";
   storageMedium = "sd_card";
   storageUsedPct = calculateStorageUsage(SD.totalBytes(), SD.usedBytes());
+
+  if (diagTracker.lastSdState != "ready") {
+    String prevState = diagTracker.lastSdState;
+    diagTracker.lastSdState = "ready";
+    logDiagnosticEvent("sd_card", "SD_CARD_RECOVERED", "info", prevState.c_str(), "ready", "MicroSD card mounted and verified on SPI bus", nullptr, true);
+  }
 
   if (verbose) {
     Serial.printf("[SD] OK: MicroSD mounted (Used: %.2f%%)\n", storageUsedPct);
@@ -964,6 +1044,11 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
       return true;
     }
     sdCardStatus = "write_error";
+    if (diagTracker.lastSdState != "write_error") {
+      String prevState = diagTracker.lastSdState;
+      diagTracker.lastSdState = "write_error";
+      logDiagnosticEvent("sd_card", "SD_CARD_WRITE_FAILED", "error", prevState.c_str(), "write_error", "Failed to write telemetry record to SD card", nullptr, false);
+    }
     if (!littleFsReady) initialiseLittleFSFallback();
   }
 
@@ -1022,10 +1107,20 @@ void discoverTemperatureProbes(bool verbose = true) {
     sensorMotor.setResolution(motorProbeAddress, 12);
     sensorMotor.setWaitForConversion(false);
     motorProbeFound = true;
+    if (diagTracker.lastMotorTempState != "operational") {
+      String prevState = diagTracker.lastMotorTempState;
+      diagTracker.lastMotorTempState = "operational";
+      logDiagnosticEvent("motor_temp", "MOTOR_TEMP_SENSOR_RECOVERED", "info", prevState.c_str(), "operational", "Motor DS18B20 probe detected on GPIO 10", nullptr, true);
+    }
     if (verbose) Serial.println("[DS18B20-MOTOR] OK: Motor probe detected on GPIO 10.");
   } else {
     motorProbeFound = false;
     motorTempValid = false;
+    if (diagTracker.lastMotorTempState != "missing") {
+      String prevState = diagTracker.lastMotorTempState;
+      diagTracker.lastMotorTempState = "missing";
+      logDiagnosticEvent("motor_temp", "MOTOR_TEMP_SENSOR_MISSING", "warning", prevState.c_str(), "missing", "Motor DS18B20 probe not responding on 1-Wire GPIO 10", nullptr, false);
+    }
   }
 
   sensorAmbient.begin();
@@ -1033,10 +1128,20 @@ void discoverTemperatureProbes(bool verbose = true) {
     sensorAmbient.setResolution(ambientProbeAddress, 12);
     sensorAmbient.setWaitForConversion(false);
     ambientProbeFound = true;
+    if (diagTracker.lastAmbientTempState != "operational") {
+      String prevState = diagTracker.lastAmbientTempState;
+      diagTracker.lastAmbientTempState = "operational";
+      logDiagnosticEvent("ambient_temp", "AMBIENT_TEMP_SENSOR_RECOVERED", "info", prevState.c_str(), "operational", "Ambient DS18B20 probe detected on GPIO 11", nullptr, true);
+    }
     if (verbose) Serial.println("[DS18B20-AMBIENT] OK: Ambient probe detected on GPIO 11.");
   } else {
     ambientProbeFound = false;
     ambientTempValid = false;
+    if (diagTracker.lastAmbientTempState != "missing") {
+      String prevState = diagTracker.lastAmbientTempState;
+      diagTracker.lastAmbientTempState = "missing";
+      logDiagnosticEvent("ambient_temp", "AMBIENT_TEMP_SENSOR_MISSING", "warning", prevState.c_str(), "missing", "Ambient DS18B20 probe not responding on 1-Wire GPIO 11", nullptr, false);
+    }
   }
 }
 
@@ -1102,6 +1207,14 @@ void startWiFiConnection() {
 
 void maintainWiFiAsync() {
   if (WiFi.status() == WL_CONNECTED) {
+    if (diagTracker.lastWifiState != "connected") {
+      String prevState = diagTracker.lastWifiState;
+      diagTracker.lastWifiState = "connected";
+      char ipBuf[64];
+      snprintf(ipBuf, sizeof(ipBuf), "{\"ip\":\"%s\",\"rssi_dbm\":%d}",
+               WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      logDiagnosticEvent("wifi", "WIFI_CONNECTED", "info", prevState.c_str(), "connected", "Wi-Fi associated and IP acquired", ipBuf, true);
+    }
     wifiBackoffMs = 5000; // Reset backoff upon successful connection
     if (!rtcSynced && (millis() - lastNtpAttemptMs > 60000)) {
       lastNtpAttemptMs = millis();
@@ -1109,6 +1222,11 @@ void maintainWiFiAsync() {
       syncRtcFromNtp();
     }
     return;
+  }
+
+  if (diagTracker.lastWifiState == "connected") {
+    diagTracker.lastWifiState = "disconnected";
+    logDiagnosticEvent("wifi", "WIFI_DISCONNECTED", "warning", "connected", "disconnected", "Wi-Fi link dropped, entering reconnect backoff", nullptr, false);
   }
 
   uint32_t now = millis();
@@ -1147,6 +1265,188 @@ int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
 
   perfMetrics.lastUploadDurationMs = (uint32_t)((esp_timer_get_time() - uploadStartUs) / 1000);
   return httpCode;
+}
+
+int sendDiagnosticEventPayload(const String &jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+
+  WiFiClientSecure client;
+  client.setCACert(VERCEL_ROOT_CA_CERT);
+
+  HTTPClient http;
+  http.begin(client, SERVER_EVENTS_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
+  http.setTimeout(3500);
+
+  int httpCode = http.POST(jsonPayload);
+  http.end();
+  return httpCode;
+}
+
+bool saveDiagnosticEventToQueue(const String &eventId, const String &jsonPayload) {
+  if (sdCardReady) {
+    if (!SD.exists("/events")) SD.mkdir("/events");
+    String filename = String("/events/ev_") + eventId + ".json";
+    File f = SD.open(filename.c_str(), FILE_WRITE);
+    if (f) {
+      f.print(jsonPayload);
+      f.close();
+      return true;
+    }
+  }
+
+  if (littleFsReady) {
+    if (!LittleFS.exists("/lfs_events")) LittleFS.mkdir("/lfs_events");
+    String filename = String("/lfs_events/ev_") + eventId + ".json";
+    File f = LittleFS.open(filename.c_str(), FILE_WRITE);
+    if (f) {
+      f.print(jsonPayload);
+      f.close();
+      return true;
+    }
+  }
+  return false;
+}
+
+void logDiagnosticEvent(
+    const char *component,
+    const char *eventCode,
+    const char *severity,
+    const char *prevState,
+    const char *newState,
+    const char *diagnosticMsg,
+    const char *detailsJson,
+    bool resolved
+) {
+  diagTracker.eventSequence++;
+  char eventId[64];
+  snprintf(eventId, sizeof(eventId), "evt-%s-%lu-%u",
+           DEVICE_ID, (unsigned long)time(nullptr), diagTracker.eventSequence);
+
+  String timestamp = getRtcIsoTimestamp();
+  const char *tsSource = "rtc";
+  if (timestamp.length() == 0) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "1970-01-01T00:00:%02luZ", (unsigned long)(millis() / 1000));
+    timestamp = String(buf);
+    tsSource = "system";
+  } else if (rtcSynced) {
+    tsSource = "ntp";
+  }
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument doc;
+#else
+  DynamicJsonDocument doc(1024);
+#endif
+
+  doc["id"] = eventId;
+  doc["device_id"] = DEVICE_ID;
+  doc["component"] = component;
+  doc["event_code"] = eventCode;
+  doc["severity"] = severity;
+  if (prevState) doc["previous_state"] = prevState;
+  else doc["previous_state"] = nullptr;
+  doc["new_state"] = newState;
+  doc["event_timestamp"] = timestamp;
+  doc["timestamp_source"] = tsSource;
+  doc["diagnostic_message"] = diagnosticMsg;
+  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["resolved"] = resolved;
+
+  if (detailsJson) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument detDoc;
+#else
+    StaticJsonDocument<256> detDoc;
+#endif
+    deserializeJson(detDoc, detailsJson);
+    doc["details"] = detDoc.as<JsonObject>();
+  } else {
+    doc["details"] = nullptr;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.printf("[DIAG-EVENT] [%s] %s (%s -> %s): %s\n",
+                component, eventCode, prevState ? prevState : "none", newState, diagnosticMsg);
+
+  // If connected, attempt direct upload
+  if (WiFi.status() == WL_CONNECTED) {
+    int httpCode = sendDiagnosticEventPayload(payload);
+    if (httpCode >= 200 && httpCode < 300) {
+      return;
+    }
+  }
+
+  // Otherwise queue locally for resilient sync
+  saveDiagnosticEventToQueue(String(eventId), payload);
+}
+
+void processEventsQueue() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  uint32_t now = millis();
+  if (now - diagTracker.lastEventSyncMs < 4000) return;
+  diagTracker.lastEventSyncMs = now;
+
+  // Process SD card events first
+  if (sdCardReady) {
+    File dir = SD.open("/events");
+    if (dir && dir.isDirectory()) {
+      File entry = dir.openNextFile();
+      uint8_t count = 0;
+      while (entry && count < 5) {
+        if (!entry.isDirectory() && String(entry.name()).endsWith(".json")) {
+          String filepath = String("/events/") + entry.name();
+          String content = entry.readString();
+          entry.close();
+
+          int code = sendDiagnosticEventPayload(content);
+          if (code >= 200 && code < 300) {
+            SD.remove(filepath.c_str());
+            count++;
+          } else {
+            break; // Stop batch if network failed
+          }
+        } else {
+          entry.close();
+        }
+        entry = dir.openNextFile();
+      }
+      dir.close();
+      if (count > 0) return;
+    }
+  }
+
+  // Process LittleFS events
+  if (littleFsReady) {
+    File dir = LittleFS.open("/lfs_events");
+    if (dir && dir.isDirectory()) {
+      File entry = dir.openNextFile();
+      uint8_t count = 0;
+      while (entry && count < 5) {
+        if (!entry.isDirectory() && String(entry.name()).endsWith(".json")) {
+          String filepath = String("/lfs_events/") + entry.name();
+          String content = entry.readString();
+          entry.close();
+
+          int code = sendDiagnosticEventPayload(content);
+          if (code >= 200 && code < 300) {
+            LittleFS.remove(filepath.c_str());
+            count++;
+          } else {
+            break;
+          }
+        } else {
+          entry.close();
+        }
+        entry = dir.openNextFile();
+      }
+      dir.close();
+    }
+  }
 }
 
 void sendDeviceCommandAck(const char *commandId, const char *status, const char *resultJson, const char *errorMessage) {
@@ -1453,10 +1753,20 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
     int httpCode = sendTelemetryPayload(payload, responseStr);
     if (httpCode >= 200 && httpCode < 300) {
       synced = true;
+      if (diagTracker.lastApiState != "healthy") {
+        diagTracker.lastApiState = "healthy";
+        logDiagnosticEvent("api", "API_UPLOAD_RECOVERED", "info", "failing", "healthy", "HTTPS telemetry upload successfully restored", nullptr, true);
+      }
       consecutiveUploadFailures = 0;
       lastSuccessfulUploadMs = millis();
     } else {
       consecutiveUploadFailures++;
+      if (consecutiveUploadFailures == 3 && diagTracker.lastApiState != "failing") {
+        diagTracker.lastApiState = "failing";
+        char errBuf[64];
+        snprintf(errBuf, sizeof(errBuf), "{\"http_code\":%d,\"consecutive_failures\":%u}", httpCode, consecutiveUploadFailures);
+        logDiagnosticEvent("api", "API_UPLOAD_FAILED", "error", "healthy", "failing", "HTTPS telemetry upload failed repeatedly", errBuf, false);
+      }
       saveRecordToQueue(recordId, payload);
     }
   } else {
@@ -1527,6 +1837,8 @@ void setup() {
   lastCommandPollMs = millis();
   lastPerfLogMs = millis();
 
+  logDiagnosticEvent("esp32", "CONTROLLER_BOOTED", "info", "power_on", "running", "ESP32-S3 firmware initialized and runtime active", nullptr, true);
+
   Serial.println("[SYSTEM] Real-time monitoring active. Entering background loop.\n");
 }
 
@@ -1538,6 +1850,15 @@ void loop() {
   updateTemperaturesAsync();
   checkSensorRecovery();
   processBacklogQueue();
+  processEventsQueue();
+
+  // Edge-triggered vibration classifier state change detection (thread-safe, executed on Core 1)
+  if (currentCondition != diagTracker.lastClassifierState) {
+    String prevCond = diagTracker.lastClassifierState;
+    diagTracker.lastClassifierState = currentCondition;
+    const char *sev = (currentCondition == "CRITICAL") ? "critical" : (currentCondition == "WARNING") ? "warning" : "info";
+    logDiagnosticEvent("classifier", "VIBRATION_STATE_CHANGED", sev, prevCond.c_str(), currentCondition.c_str(), currentConditionReason.c_str(), nullptr, currentCondition == "GOOD");
+  }
 
   uint32_t now = millis();
 

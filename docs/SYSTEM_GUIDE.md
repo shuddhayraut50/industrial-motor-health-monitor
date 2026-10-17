@@ -243,3 +243,57 @@ The firmware includes low-overhead timing measurements using `esp_timer_get_time
 ```
 
 These metrics are transmitted during every 5-second serial diagnostic report and exposed via the `STATUS_REQUEST` two-way command for remote engineering inspection.
+
+---
+
+## 8. Event-Based Diagnostic Logging & Subsystem Status Engine
+
+### 8.1 Inconsistent Status Root Cause & Resolution
+Previously, the dashboard could display `ESP32 Controller: Offline` while sensor indicators reported `Operational`, Wi-Fi displayed `-20 dBm`, and the subtext read `HTTPS Ingest: OK`.
+
+1. **Stale vs Offline Ternary Evaluation Bug:**
+   - In `src/app/dashboard/page.tsx`, `Header.tsx`, and `SimpleMotorView.tsx`, status logic was written as:
+     `!isOnline ? 'offline' : isStale ? 'stale' : 'online'`
+   - When a device reached the stale window (25s–120s without a packet), `isOnline` ($<25\text{s}$) evaluated to `false`. The first condition `!isOnline` caught the device and immediately branded it `OFFLINE`, skipping the intended `STALE` state.
+   - Individual sensor cards remained in their last cached "Operational" state because sensor health checks evaluated the latest telemetry record, producing contradictory UI cards.
+   - **Fix:** Corrected precedence to `isOnline ? 'online' : isStale ? 'stale' : 'offline'`.
+
+2. **Authoritative `last_seen_at` Resolution:**
+   - In `/api/telemetry/live`, connection status now determines the device timestamp using the maximum of `device.last_seen_at` (updated by telemetry uploads, diagnostic event syncs, or authenticated heartbeats) and `latest.recorded_at`.
+   - Distinct connection states are enforced: `ONLINE` ($<25\text{s}$), `STALE` ($25\text{s}\text{--}120\text{s}$), and `OFFLINE` ($>120\text{s}$).
+
+3. **Wi-Fi RSSI Sanitization & Ingest Truth:**
+   - Wi-Fi RSSI of `-20 dBm` represents bench-testing proximity (within 5–10 cm of the AP). However, displaying a static RSSI when the device is disconnected gave the illusion of continuous link integrity.
+   - Values $\ge 0\,\text{dBm}$ or $< -105\,\text{dBm}$ are now sanitized to "Signal N/A".
+   - Subtext no longer hardcodes "HTTPS Ingest: OK". It accurately computes:
+     - `Ingest Active (<15s)` if live packet received within 15 seconds.
+     - `Delayed (Xs)` if packet age is 15s–120s.
+     - `Link Down` if controller is offline.
+
+4. **MicroSD Card Warning & Active Flash Fallback:**
+   - When no physical MicroSD card is inserted into the SPI slot, `SD.cardType()` returns `CARD_NONE`.
+   - The firmware gracefully mounts internal SPI flash (`LittleFS`) as the primary buffer.
+   - The UI displays an amber badge: `Flash Fallback` with subtext `LittleFS Flash (${storage_used_pct}% used)` so operators understand that offline telemetry retention remains active.
+
+---
+
+### 8.2 Event-Based Diagnostic Subsystem Architecture
+To eliminate polling noise and prevent high-frequency database writes, the ESP32-S3 firmware implements an **edge-triggered state transition engine** (`DiagnosticStateTracker`).
+
+#### Monitored Subsystems (10 Independent Components)
+1. **ESP32 Controller / Runtime:** Boot (`CONTROLLER_BOOTED`), reset reasons, and heartbeat tracking.
+2. **Wi-Fi Link:** `WIFI_CONNECTED`, `WIFI_DISCONNECTED` (distinguished from API availability).
+3. **HTTPS / API Ingest:** Debounced 3-strike upload failure (`API_UPLOAD_FAILED`), recovery (`API_UPLOAD_RECOVERED`).
+4. **ADXL345 Accelerometer:** Bus communication fault (`ADXL345_NOT_RESPONDING`), recovery (`ADXL345_RECOVERED`).
+5. **Motor DS18B20:** Missing sensor reading (`MOTOR_TEMP_SENSOR_MISSING`), bus recovery (`MOTOR_TEMP_SENSOR_RECOVERED`).
+6. **Ambient DS18B20:** Missing sensor reading (`AMBIENT_TEMP_SENSOR_MISSING`), recovery (`AMBIENT_TEMP_SENSOR_RECOVERED`).
+7. **MicroSD / Storage:** Card missing (`SD_CARD_MISSING`), write failure (`SD_CARD_WRITE_FAILED`), recovery (`SD_CARD_RECOVERED`).
+8. **DS3231 RTC:** Clock oscillator stopped or invalid date (`RTC_INVALID`), recovery (`RTC_RECOVERED`).
+9. **Local Vibration Classifier:** Machine condition transitions (`VIBRATION_STATE_CHANGED`).
+10. **Command Execution:** Lifecycle states for operator diagnostic actions (`COMMAND_EXECUTED`).
+
+#### Edge-Triggering & Noise Immunity Rules
+- An event is dispatched **only** when a component changes state, a new fault begins, or a fault recovers.
+- Regular 5-second telemetry cycles do not emit diagnostic events.
+- Core 0 real-time sampling is completely non-blocking. Event generation writes to an in-memory queue without holding I2C or networking locks.
+- Offline events are persisted to MicroSD (`/events`) or LittleFS (`/lfs_events`) with idempotent UUIDs, ensuring zero duplicate records upon network reconnection.

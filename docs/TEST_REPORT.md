@@ -10,11 +10,11 @@ All automated checks were executed locally in the project environment and passed
 
 | Test Suite / Tool | Scope | Target | Result | Notes |
 |---|---|---|:---:|---|
-| **PlatformIO GCC 8.4.0** | ESP32-S3 Firmware Compilation | `esp32-s3-devkitc-1` (N16R8) | **PASSED** | RAM: 14.3% (46.8KB / 327.6KB)<br>Flash: 30.4% (1016.1KB / 3.34MB)<br>ELF binary generated cleanly. |
-| **Vitest Unit Tests** | Validation, DB Helpers, Fast Detection | `npm test` | **PASSED** | **56 / 56 passed** (100%)<br>Covers rolling RMS, fast condition debounce, safety overrides, telemetry schemas, and commands. |
-| **TypeScript Compiler** | Type Safety & Strict Checking | `npm run typecheck` | **PASSED** | **0 errors**. All types and API routes strictly typed. |
+| **PlatformIO GCC 8.4.0** | ESP32-S3 Firmware Compilation | `esp32-s3-devkitc-1` (N16R8) | **PASSED** | RAM: 14.3% (46.9KB / 327.6KB)<br>Flash: 30.7% (1025.1KB / 3.34MB)<br>ELF & BIN images generated cleanly in 23s. |
+| **Vitest Unit Tests** | Validation, DB Helpers, Diagnostics, Fast Detection | `npm test` | **PASSED** | **63 / 63 passed** (100%)<br>Covers rolling RMS, fast condition debounce, diagnostic state tracking, deduplication, schemas, and commands. |
+| **TypeScript Compiler** | Type Safety & Strict Checking | `npm run typecheck` | **PASSED** | **0 errors**. All types, event models, and API routes strictly typed. |
 | **ESLint** | Code Quality & Style | `npm run lint` | **PASSED** | **0 errors, 0 warnings**. |
-| **Next.js Turbopack Build** | Production Web Application | `npm run build` | **PASSED** | All 17 static and dynamic API routes compiled cleanly into production bundle. |
+| **Next.js Turbopack Build** | Production Web Application | `npm run build` | **PASSED** | All static and dynamic API routes compiled cleanly into production bundle. |
 | **Playwright E2E Tests** | End-to-End User Journeys | `npx playwright test` | **PASSED** | **34 / 34 passed** (100%)<br>Covers dashboard loading, sensor fault tolerance, history views, and metrics. |
 
 ---

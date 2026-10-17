@@ -6,6 +6,7 @@ import {
   CreateCommandRequest,
   CommandAckRequest,
 } from '../types/commands';
+import { DeviceDiagnosticEvent, DiagnosticEventsFilter } from '../types/events';
 
 // In-memory test store used for local testing, CI, and Playwright verification
 class MockDatabaseStore {
@@ -14,6 +15,7 @@ class MockDatabaseStore {
   configs: Map<string, DeviceConfig[]> = new Map();
   acks: Map<string, DeviceConfigAck[]> = new Map();
   commands: DeviceCommandRecord[] = [];
+  events: DeviceDiagnosticEvent[] = [];
 
   constructor() {
     this.seedDefault();
@@ -25,6 +27,7 @@ class MockDatabaseStore {
     this.configs.clear();
     this.acks.clear();
     this.commands = [];
+    this.events = [];
 
     const now = new Date();
     // Default prototype device
@@ -90,6 +93,56 @@ class MockDatabaseStore {
         });
       }
     }
+
+    // Seed baseline diagnostic events
+    this.events.push({
+      id: 'e0000001-0000-0000-0000-000000000001',
+      device_id: 'motor-monitor-001',
+      component: 'esp32',
+      event_code: 'BOOT_INITIALIZED',
+      severity: 'info',
+      previous_state: null,
+      new_state: 'READY',
+      event_timestamp: new Date(now.getTime() - 7200000).toISOString(),
+      timestamp_source: 'system',
+      diagnostic_message: 'ESP32-S3 firmware initialized with Core 0 real-time engine',
+      details: { fw: '1.5.0-fast-rt', cores: 2 },
+      firmware_version: '1.5.0-fast-rt',
+      resolved: true,
+      server_received_at: new Date(now.getTime() - 7200000).toISOString(),
+    });
+    this.events.push({
+      id: 'e0000001-0000-0000-0000-000000000002',
+      device_id: 'motor-monitor-001',
+      component: 'wifi',
+      event_code: 'WIFI_CONNECTED',
+      severity: 'info',
+      previous_state: 'DISCONNECTED',
+      new_state: 'CONNECTED',
+      event_timestamp: new Date(now.getTime() - 7190000).toISOString(),
+      timestamp_source: 'system',
+      diagnostic_message: 'Wi-Fi station associated and IP acquired',
+      details: { rssi_dbm: -62 },
+      firmware_version: '1.5.0-fast-rt',
+      resolved: true,
+      server_received_at: new Date(now.getTime() - 7190000).toISOString(),
+    });
+    this.events.push({
+      id: 'e0000001-0000-0000-0000-000000000003',
+      device_id: 'motor-monitor-001',
+      component: 'sd_card',
+      event_code: 'SD_CARD_MISSING',
+      severity: 'warning',
+      previous_state: 'UNKNOWN',
+      new_state: 'MISSING',
+      event_timestamp: new Date(now.getTime() - 7180000).toISOString(),
+      timestamp_source: 'system',
+      diagnostic_message: 'MicroSD SPI mount failed. Internal LittleFS flash fallback activated.',
+      details: { fallback: 'flash_littlefs', cs_pin: 15 },
+      firmware_version: '1.5.0-fast-rt',
+      resolved: false,
+      server_received_at: new Date(now.getTime() - 7180000).toISOString(),
+    });
   }
 
   clear() {
@@ -98,6 +151,7 @@ class MockDatabaseStore {
     this.configs.clear();
     this.acks.clear();
     this.commands = [];
+    this.events = [];
   }
 }
 
@@ -943,5 +997,132 @@ export async function getDeviceCommandsHistory(
     .filter((c) => c.device_id === deviceId)
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
     .slice(0, limit);
+}
+
+/**
+ * Inserts a single diagnostic event with idempotency.
+ */
+export async function insertDiagnosticEvent(
+  event: DeviceDiagnosticEvent
+): Promise<DeviceDiagnosticEvent> {
+  const res = await insertDiagnosticEventsBatch([event]);
+  if (res.inserted > 0 || res.skipped > 0) {
+    return event;
+  }
+  return event;
+}
+
+/**
+ * Inserts a batch of diagnostic events idempotently.
+ * Ignores duplicate event IDs.
+ */
+export async function insertDiagnosticEventsBatch(
+  events: DeviceDiagnosticEvent[]
+): Promise<{ inserted: number; skipped: number }> {
+  if (events.length === 0) return { inserted: 0, skipped: 0 };
+  const admin = getAdminClient();
+  let inserted = 0;
+  let skipped = 0;
+
+  if (admin) {
+    try {
+      const recordsToInsert = events.map((e) => ({
+        id: e.id,
+        device_id: e.device_id,
+        component: e.component,
+        event_code: e.event_code,
+        severity: e.severity,
+        previous_state: e.previous_state ?? null,
+        new_state: e.new_state,
+        event_timestamp: e.event_timestamp,
+        timestamp_source: e.timestamp_source ?? 'system',
+        diagnostic_message: e.diagnostic_message,
+        details: e.details ?? {},
+        firmware_version: e.firmware_version ?? null,
+        resolved: e.resolved ?? false,
+      }));
+
+      const { data, error } = await admin
+        .from('device_diagnostic_events')
+        .upsert(recordsToInsert, { onConflict: 'id', ignoreDuplicates: true })
+        .select();
+
+      if (!error && data) {
+        inserted = data.length;
+        skipped = events.length - inserted;
+        return { inserted, skipped };
+      }
+    } catch (e) {
+      console.warn(`[SUPABASE_EVENTS_FALLBACK] Error writing events to Supabase: ${e}. Using mock store.`);
+    }
+  }
+
+  // Mock store fallback (idempotent: skip existing IDs)
+  for (const ev of events) {
+    const exists = mockDb.events.some((existing) => existing.id === ev.id);
+    if (!exists) {
+      mockDb.events.push({
+        ...ev,
+        server_received_at: ev.server_received_at || new Date().toISOString(),
+      });
+      inserted++;
+    } else {
+      skipped++;
+    }
+  }
+
+  return { inserted, skipped };
+}
+
+/**
+ * Retrieves filtered diagnostic events timeline for a device (newest first).
+ */
+export async function getDeviceDiagnosticEvents(
+  options: DiagnosticEventsFilter
+): Promise<DeviceDiagnosticEvent[]> {
+  const admin = getAdminClient();
+  const limit = options.limit ?? 50;
+  const offset = options.offset ?? 0;
+
+  if (admin) {
+    try {
+      let query = admin
+        .from('device_diagnostic_events')
+        .select('*')
+        .eq('device_id', options.deviceId);
+
+      if (options.component && options.component !== 'all') {
+        query = query.eq('component', options.component);
+      }
+      if (options.severity && options.severity !== 'all') {
+        query = query.eq('severity', options.severity);
+      }
+      if (options.unresolvedOnly) {
+        query = query.eq('resolved', false);
+      }
+
+      const { data, error } = await query
+        .order('event_timestamp', { ascending: false })
+        .range(offset, offset + limit - 1);
+
+      if (!error && data) {
+        return data as DeviceDiagnosticEvent[];
+      }
+    } catch (e) {
+      console.warn(`[SUPABASE_GET_EVENTS_FALLBACK] Error fetching events: ${e}. Using mock store.`);
+    }
+  }
+
+  // Mock store fallback
+  return mockDb.events
+    .filter((e) => {
+      if (e.device_id !== options.deviceId) return false;
+      if (options.component && options.component !== 'all' && e.component !== options.component) return false;
+      if (options.severity && options.severity !== 'all' && e.severity !== options.severity) return false;
+      if (options.unresolvedOnly && e.resolved) return false;
+      return true;
+    })
+    .sort((a, b) => new Date(b.event_timestamp).getTime() - new Date(a.event_timestamp).getTime())
+    .slice(offset, offset + limit);
 }
 

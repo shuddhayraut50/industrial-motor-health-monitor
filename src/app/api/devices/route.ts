@@ -22,24 +22,25 @@ export async function GET() {
           const nowMs = Date.now();
           const recMs = new Date(latest.recorded_at).getTime();
           ageSeconds = Math.max(0, Math.round((nowMs - recMs) / 1000));
-          const reportingIntervalSec = (config?.reporting_interval_ms ?? 1000) / 1000;
-          const gracePeriodSec = Math.max(10, reportingIntervalSec * 3);
+          const reportingIntervalSec = (config?.reporting_interval_ms ?? 5000) / 1000;
+          const gracePeriodSec = Math.max(25, reportingIntervalSec * 5);
+          const stalePeriodSec = 120;
           isOnline = ageSeconds <= gracePeriodSec;
-          isStale = ageSeconds > gracePeriodSec;
+          isStale = ageSeconds > gracePeriodSec && ageSeconds <= stalePeriodSec;
         }
 
         const sensorHealth = {
-          esp32: isOnline ? (isStale ? 'stale' : 'online') : 'offline',
-          wifi: isOnline
+          esp32: isOnline ? 'online' : (isStale ? 'stale' : 'offline'),
+          wifi: isOnline || isStale
             ? { status: 'connected', rssi_dbm: latest?.wifi_rssi_dbm ?? dev?.wifi_rssi_dbm ?? null }
             : { status: 'offline', rssi_dbm: null },
-          adxl345: !isOnline
+          adxl345: !isOnline && !isStale
             ? 'no_data'
             : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
-          motor_temp: !isOnline
+          motor_temp: !isOnline && !isStale
             ? 'no_data'
             : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
-          ambient_temp: !isOnline
+          ambient_temp: !isOnline && !isStale
             ? 'no_data'
             : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
         };

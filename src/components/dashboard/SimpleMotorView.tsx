@@ -161,7 +161,7 @@ export function SimpleMotorView({
           <div className="text-left md:text-right shrink-0">
             <span className="text-xs text-slate-400 uppercase tracking-wider block">Communication Status</span>
             <span className="font-mono text-xs font-semibold text-slate-200">
-              {!isOnline ? '🔴 Device Offline' : isStale ? '🟡 Stale (>25s)' : '🟢 Active Real-Time'}
+              {isOnline ? '🟢 Active Real-Time' : isStale ? '🟡 Stale (>25s)' : '🔴 Device Offline'}
             </span>
             {isDelayedData && (
               <span className="text-[11px] text-amber-400 block mt-0.5">

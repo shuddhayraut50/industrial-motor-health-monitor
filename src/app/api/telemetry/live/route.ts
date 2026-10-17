@@ -15,16 +15,36 @@ export async function GET(request: NextRequest) {
 
     const latest = records.length > 0 ? records[records.length - 1] : null;
 
+    // Use most authoritative last seen timestamp between device.last_seen_at and latest telemetry
+    const deviceLastSeenMs = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
+    const latestTelemetryMs = latest?.recorded_at ? new Date(latest.recorded_at).getTime() : 0;
+    const authoritativeLastSeenMs = Math.max(deviceLastSeenMs, latestTelemetryMs);
+    const authoritativeLastSeenIso = authoritativeLastSeenMs > 0 ? new Date(authoritativeLastSeenMs).toISOString() : null;
+
+    const effectiveDevice = device
+      ? { ...device, last_seen_at: authoritativeLastSeenIso ?? device.last_seen_at }
+      : (authoritativeLastSeenIso
+        ? {
+            id: `dev-${deviceId}`,
+            device_id: deviceId,
+            display_name: deviceId,
+            location: 'Field',
+            enabled: true,
+            last_seen_at: authoritativeLastSeenIso,
+            created_at: authoritativeLastSeenIso,
+            updated_at: authoritativeLastSeenIso,
+          }
+        : null);
+
     // Strict server-side connection status calculation
-    const connectionStatus = calculateDeviceConnectionStatus(device);
+    const connectionStatus = calculateDeviceConnectionStatus(effectiveDevice);
     const isOnline = connectionStatus === 'ONLINE';
     const isStale = connectionStatus === 'STALE';
 
     let ageSeconds: number | null = null;
-    if (device?.last_seen_at) {
+    if (authoritativeLastSeenIso) {
       const nowMs = Date.now();
-      const lastSeenMs = new Date(device.last_seen_at).getTime();
-      ageSeconds = Math.max(0, Math.round((nowMs - lastSeenMs) / 1000));
+      ageSeconds = Math.max(0, Math.round((nowMs - authoritativeLastSeenMs) / 1000));
     }
 
     // Condition status from local ESP32 evaluation
@@ -41,22 +61,37 @@ export async function GET(request: NextRequest) {
       oldest_unsynced_timestamp: latest?.oldest_unsynced_timestamp ?? null,
     };
 
+    // Validate RSSI: Standard 2.4GHz Wi-Fi RSSI is between -100 and -15 dBm.
+    // Suspicious or invalid values (e.g. >= 0, < -110) are flagged.
+    const rawRssi = latest?.wifi_rssi_dbm ?? device?.wifi_rssi_dbm ?? null;
+    const isValidRssi = rawRssi !== null && rawRssi >= -105 && rawRssi <= -10;
+    const sanitizedRssi = isValidRssi ? rawRssi : null;
+
     // Independent sensor health statuses
     const sensorHealth = {
-      esp32: isOnline ? (isStale ? 'stale' : 'online') : 'offline',
-      wifi: isOnline || isStale
-        ? { status: 'connected', rssi_dbm: latest?.wifi_rssi_dbm ?? device?.wifi_rssi_dbm ?? null }
-        : { status: 'offline', rssi_dbm: null },
+      esp32: isOnline ? 'online' : (isStale ? 'stale' : 'offline'),
+      wifi: isOnline
+        ? { status: 'connected', rssi_dbm: sanitizedRssi, raw_rssi: rawRssi, ingest_state: 'active' }
+        : isStale
+        ? { status: 'connected', rssi_dbm: sanitizedRssi, raw_rssi: rawRssi, ingest_state: 'delayed' }
+        : { status: 'offline', rssi_dbm: null, raw_rssi: null, ingest_state: 'none' },
       adxl345: !isOnline && !isStale
         ? 'no_data'
+        : isStale
+        ? (latest?.sensor_status?.adxl345 === 'ready' ? 'cached' : latest?.sensor_status?.adxl345 ?? 'not_detected')
         : latest?.sensor_status?.adxl345 ?? (latest?.rms_z_g !== null && latest?.rms_z_g !== undefined ? 'ready' : 'not_detected'),
       motor_temp: !isOnline && !isStale
         ? 'no_data'
+        : isStale
+        ? (latest?.sensor_status?.motor_temp === 'ready' ? 'cached' : latest?.sensor_status?.motor_temp ?? 'not_detected')
         : latest?.sensor_status?.motor_temp ?? (latest?.motor_temp_c !== null && latest?.motor_temp_c !== undefined ? 'ready' : 'not_detected'),
       ambient_temp: !isOnline && !isStale
         ? 'no_data'
+        : isStale
+        ? (latest?.sensor_status?.ambient_temp === 'ready' ? 'cached' : latest?.sensor_status?.ambient_temp ?? 'not_detected')
         : latest?.sensor_status?.ambient_temp ?? (latest?.ambient_temp_c !== null && latest?.ambient_temp_c !== undefined ? 'ready' : 'not_detected'),
       sd_card: storageDiagnostics.sd_card_status,
+      storage_medium: storageDiagnostics.medium,
       rtc: {
         status: latest?.rtc_status ?? device?.rtc_status ?? 'not_detected',
         synced: Boolean(latest?.rtc_synced),
