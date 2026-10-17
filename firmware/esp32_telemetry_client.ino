@@ -10,7 +10,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+#include <esp_timer.h>
 #include <math.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "certificates.h"
@@ -40,13 +42,15 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.4.0";
+const char *FIRMWARE_VERSION = "1.5.0-fast-rt";
 
-const uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000us = 5ms -> 200 Hz
-const uint32_t REPORT_INTERVAL_MS = 5000;       // 5-second reporting cadence
-const uint32_t TEMP_CONV_MS = 750;              // DS18B20 12-bit conversion time
-const uint32_t REDISCOVERY_INTERVAL_MS = 15000; // 15-second probe re-scan
-const float STORAGE_CEILING_LIMIT_PCT = 90.0f;  // Strict 90% storage capacity ceiling
+// Timing & Cadence Constants
+constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
+constexpr size_t FAST_WINDOW_SAMPLES = 50;           // 50 samples @ 200 Hz = 250 ms fast evaluation
+constexpr uint32_t REPORT_INTERVAL_MS = 5000;        // 5-second telemetry upload cadence
+constexpr uint32_t TEMP_CONV_MS = 750;               // DS18B20 12-bit conversion time
+constexpr uint32_t REDISCOVERY_INTERVAL_MS = 15000;  // 15-second background probe re-scan
+constexpr float STORAGE_CEILING_LIMIT_PCT = 90.0f;   // Strict 90% storage capacity ceiling
 
 // ADXL345 Registers & Constants
 constexpr uint8_t REG_DEVID = 0x00;
@@ -68,17 +72,17 @@ DeviceAddress ambientProbeAddress;
 SPIClass spiSD(FSPI);
 
 // Sensor & Peripheral Health
-bool adxlReady = false;
-bool adxlError = false;
-bool motorProbeFound = false;
-bool ambientProbeFound = false;
-float currentMotorTemp = 0.0f;
-float currentAmbientTemp = 0.0f;
-bool motorTempValid = false;
-bool ambientTempValid = false;
+volatile bool adxlReady = false;
+volatile bool adxlError = false;
+volatile bool motorProbeFound = false;
+volatile bool ambientProbeFound = false;
+volatile float currentMotorTemp = 0.0f;
+volatile float currentAmbientTemp = 0.0f;
+volatile bool motorTempValid = false;
+volatile bool ambientTempValid = false;
 
-bool rtcReady = false;
-bool rtcSynced = false;
+volatile bool rtcReady = false;
+volatile bool rtcSynced = false;
 String rtcStatus = "not_detected";
 
 // Storage Hierarchy States
@@ -102,27 +106,112 @@ struct AlertThresholds {
   float rms_critical_g = 0.45f;
 } alertThresholds;
 
-// Local Condition Classification (debounced)
+// Local Condition State (Evaluated every 250 ms on Core 0)
 String currentCondition = "UNKNOWN";
 String currentConditionReason = "Initial startup observation";
 String pendingCondition = "UNKNOWN";
 uint8_t conditionPersistenceCount = 0;
-const uint8_t CONDITION_PERSISTENCE_THRESHOLD = 2; // 2 windows hysteresis
+constexpr uint8_t CONDITION_PERSISTENCE_THRESHOLD = 2; // 2 fast cycles (500 ms) for warning/check
 
-// Telemetry & Upload Scheduling
+// Network & Background State
 uint32_t consecutiveUploadFailures = 0;
 uint32_t lastSuccessfulUploadMs = 0;
 uint32_t nextBacklogUploadAttemptMs = 0;
 bool tempConversionPending = false;
 uint32_t lastTempRequestMs = 0;
-uint32_t lastReportMs = 0;
 uint32_t lastWiFiAttemptMs = 0;
+uint32_t wifiBackoffMs = 5000;
 uint32_t lastRediscoveryMs = 0;
 uint32_t lastNtpAttemptMs = 0;
 uint32_t lastCommandPollMs = 0;
+uint32_t lastPerfLogMs = 0;
 
-// Vibration Accumulator for 200 Hz Sampling
-struct VibrationAccumulator {
+// ==============================================================================
+// LOW-OVERHEAD PERFORMANCE INSTRUMENTATION (esp_timer_get_time monotonic)
+// ==============================================================================
+struct PerformanceMetrics {
+  uint32_t sampleIntervalUs = 0;
+  uint32_t maxSampleIntervalUs = 0;
+  uint32_t minSampleIntervalUs = 999999;
+  uint32_t sampleExecDurationUs = 0;
+  uint32_t maxSampleExecDurationUs = 0;
+  uint32_t fastRmsCalcDurationUs = 0;
+  uint32_t conditionToLedLatencyUs = 0;
+  uint32_t lastSdWriteDurationMs = 0;
+  uint32_t lastUploadDurationMs = 0;
+  uint32_t missedSampleSlots = 0;
+  uint32_t queueOverflowCount = 0;
+  UBaseType_t realtimeTaskStackWatermark = 0;
+} perfMetrics;
+
+// ==============================================================================
+// FAST ROLLING RMS ACCUMULATOR (O(1) Circular Buffer for 250 ms Window)
+// ==============================================================================
+struct RollingWindowAccumulator {
+  float bufX[FAST_WINDOW_SAMPLES] = {0};
+  float bufY[FAST_WINDOW_SAMPLES] = {0};
+  float bufZ[FAST_WINDOW_SAMPLES] = {0};
+  size_t head = 0;
+  size_t count = 0;
+  double sumX = 0;
+  double sumY = 0;
+  double sumZ = 0;
+  double sumSqX = 0;
+  double sumSqY = 0;
+  double sumSqZ = 0;
+
+  void addSample(float x, float y, float z) {
+    if (count == FAST_WINDOW_SAMPLES) {
+      float oldX = bufX[head];
+      float oldY = bufY[head];
+      float oldZ = bufZ[head];
+      sumX -= oldX;
+      sumY -= oldY;
+      sumZ -= oldZ;
+      sumSqX -= ((double)oldX * oldX);
+      sumSqY -= ((double)oldY * oldY);
+      sumSqZ -= ((double)oldZ * oldZ);
+    } else {
+      count++;
+    }
+
+    bufX[head] = x;
+    bufY[head] = y;
+    bufZ[head] = z;
+    sumX += x;
+    sumY += y;
+    sumZ += z;
+    sumSqX += ((double)x * x);
+    sumSqY += ((double)y * y);
+    sumSqZ += ((double)z * z);
+
+    head = (head + 1) % FAST_WINDOW_SAMPLES;
+  }
+
+  void calculateRms(float &rmsX, float &rmsY, float &rmsZ, float &meanX, float &meanY, float &meanZ) const {
+    if (count == 0) {
+      rmsX = rmsY = rmsZ = meanX = meanY = meanZ = 0.0f;
+      return;
+    }
+    double n = (double)count;
+    meanX = (float)(sumX / n);
+    meanY = (float)(sumY / n);
+    meanZ = (float)(sumZ / n);
+
+    double varX = (sumSqX / n) - ((double)meanX * meanX);
+    double varY = (sumSqY / n) - ((double)meanY * meanY);
+    double varZ = (sumSqZ / n) - ((double)meanZ * meanZ);
+
+    rmsX = sqrtf(fmaxf(0.0f, (float)varX));
+    rmsY = sqrtf(fmaxf(0.0f, (float)varY));
+    rmsZ = sqrtf(fmaxf(0.0f, (float)varZ));
+  }
+};
+
+// ==============================================================================
+// 5-SECOND TELEMETRY ACCUMULATOR & SNAPSHOT DISPATCH
+// ==============================================================================
+struct FiveSecAccumulator {
   double sumX = 0;
   double sumY = 0;
   double sumZ = 0;
@@ -132,10 +221,51 @@ struct VibrationAccumulator {
   uint32_t sampleCount = 0;
   uint32_t i2cErrors = 0;
   uint32_t missedSlots = 0;
+
+  void addSample(float x, float y, float z) {
+    sumX += x;
+    sumY += y;
+    sumZ += z;
+    sumSqX += ((double)x * x);
+    sumSqY += ((double)y * y);
+    sumSqZ += ((double)z * z);
+    sampleCount++;
+  }
+
+  void reset() {
+    sumX = sumY = sumZ = 0;
+    sumSqX = sumSqY = sumSqZ = 0;
+    sampleCount = 0;
+    i2cErrors = 0;
+    missedSlots = 0;
+  }
 };
 
-VibrationAccumulator liveVibration;
-SemaphoreHandle_t vibrationMutex = nullptr;
+struct TelemetrySnapshot {
+  float meanX;
+  float meanY;
+  float meanZ;
+  float rmsX;
+  float rmsY;
+  float rmsZ;
+  uint32_t sampleCount;
+  uint32_t missedSlots;
+  uint32_t i2cErrors;
+  float acquisitionQuality;
+  float motorTemp;
+  float ambientTemp;
+  bool hasMotorTemp;
+  bool hasAmbientTemp;
+  bool hasVibration;
+  char conditionStatus[16];
+  char conditionReason[160];
+  uint32_t timestampSec;
+};
+
+// FreeRTOS Queues, Mutexes, and Task Handles
+QueueHandle_t telemetrySnapshotQueue = nullptr;
+SemaphoreHandle_t i2cMutex = nullptr;
+TaskHandle_t realtimeVibrationTaskHandle = nullptr;
 
 // Non-Blocking LED Test State Machine
 enum LedTestMode {
@@ -144,7 +274,7 @@ enum LedTestMode {
   LED_TEST_RUNNING_SINGLE
 };
 
-LedTestMode activeLedTest = LED_TEST_IDLE;
+volatile LedTestMode activeLedTest = LED_TEST_IDLE;
 uint8_t testCurrentLedStep = 0;
 uint32_t testStepEndMs = 0;
 uint32_t testStepDurationMs = 500;
@@ -154,32 +284,50 @@ String activeCommandId = "";
 // Forward Declarations
 void sendDeviceCommandAck(const char *commandId, const char *status, const char *resultJson, const char *errorMessage);
 void pollDeviceCommands();
-void updateLedIndicators();
+void updateLedOutputsImmediate();
+void processBacklogQueue();
+bool enforceStorageCeilingPolicy();
 
 uint8_t bcd2dec(uint8_t val) { return (val / 16 * 10) + (val % 16); }
 uint8_t dec2bcd(uint8_t val) { return ((val / 10) << 4) | (val % 10); }
 
+// ==============================================================================
+// HARDWARE I2C ACCESS WRAPPERS (MUTEX PROTECTED)
+// ==============================================================================
 bool writeRegister(uint8_t reg, uint8_t value) {
+  if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+    return false;
+  }
   Wire.beginTransmission(ADXL345_I2C_ADDR);
   Wire.write(reg);
   Wire.write(value);
-  return (Wire.endTransmission() == 0);
+  bool ok = (Wire.endTransmission() == 0);
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
+  return ok;
 }
 
 bool readRegisters(uint8_t reg, uint8_t *buffer, size_t length) {
+  if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+    return false;
+  }
   Wire.beginTransmission(ADXL345_I2C_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.endTransmission(false) != 0) {
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
+    return false;
+  }
 
   size_t received = Wire.requestFrom((uint8_t)ADXL345_I2C_ADDR, (size_t)length, true);
   if (received != length) {
     while (Wire.available()) Wire.read();
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
     return false;
   }
 
   for (size_t i = 0; i < length; i++) {
     buffer[i] = Wire.read();
   }
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
   return true;
 }
 
@@ -192,12 +340,12 @@ bool initialiseADXL345(bool verbose = true) {
       detected = true;
       break;
     }
-    delay(50);
+    delay(20);
   }
 
   if (!detected) {
     if (verbose) {
-      Serial.printf("[ADXL345] WARNING: Sensor not detected on I2C address 0x%02X (ID=0x%02X, expected 0xE5).\n",
+      Serial.printf("[ADXL345] WARNING: Sensor not detected on I2C 0x%02X (ID=0x%02X, expected 0xE5).\n",
                     ADXL345_I2C_ADDR, deviceId);
     }
     adxlReady = false;
@@ -210,9 +358,9 @@ bool initialiseADXL345(bool verbose = true) {
   }
 
   writeRegister(REG_POWER_CTL, 0x00);
-  writeRegister(REG_BW_RATE, 0x0B);        // 200 Hz output data rate
+  writeRegister(REG_BW_RATE, 0x0B);            // 200 Hz output data rate
   writeRegister(REG_DATA_FORMAT, 0x08 | 0x03); // Full-res, +/-16g scale
-  writeRegister(REG_POWER_CTL, 0x08);        // Begin measurement mode
+  writeRegister(REG_POWER_CTL, 0x08);          // Begin measurement mode
 
   adxlReady = true;
   adxlError = false;
@@ -233,50 +381,18 @@ bool readAcceleration(float &xG, float &yG, float &zG) {
   return true;
 }
 
-void vibrationSamplingTask(void *parameter) {
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t periodTicks = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1;
-
-  for (;;) {
-    TickType_t nowTick = xTaskGetTickCount();
-    if (nowTick > lastWakeTime + periodTicks) {
-      if (xSemaphoreTake(vibrationMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        liveVibration.missedSlots++;
-        xSemaphoreGive(vibrationMutex);
-      }
-    }
-
-    if (adxlReady) {
-      float ax, ay, az;
-      if (readAcceleration(ax, ay, az)) {
-        if (xSemaphoreTake(vibrationMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-          liveVibration.sumX += ax;
-          liveVibration.sumY += ay;
-          liveVibration.sumZ += az;
-          liveVibration.sumSqX += ((double)ax * ax);
-          liveVibration.sumSqY += ((double)ay * ay);
-          liveVibration.sumSqZ += ((double)az * az);
-          liveVibration.sampleCount++;
-          xSemaphoreGive(vibrationMutex);
-        }
-      } else {
-        if (xSemaphoreTake(vibrationMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-          liveVibration.i2cErrors++;
-          xSemaphoreGive(vibrationMutex);
-        }
-      }
-    }
-    vTaskDelayUntil(&lastWakeTime, periodTicks);
-  }
-}
-
-// DS3231 RTC
+// ==============================================================================
+// DS3231 HARDWARE RTC & TIME SYNCHRONIZATION
+// ==============================================================================
 bool initialiseDS3231(bool verbose = true) {
+  if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+
   Wire.beginTransmission(DS3231_I2C_ADDR);
   if (Wire.endTransmission() != 0) {
     if (verbose) Serial.println("[DS3231] WARNING: RTC module not detected on I2C address 0x68.");
     rtcReady = false;
     rtcStatus = "not_detected";
+    if (i2cMutex) xSemaphoreGive(i2cMutex);
     return false;
   }
 
@@ -284,12 +400,7 @@ bool initialiseDS3231(bool verbose = true) {
   Wire.write(0x0F);
   if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)DS3231_I2C_ADDR, (size_t)1, true) == 1) {
     uint8_t statusReg = Wire.read();
-    if (statusReg & 0x80) {
-      if (verbose) Serial.println("[DS3231] WARNING: Oscillator Stop Flag (OSF) set. RTC time may be invalid.");
-      rtcStatus = "time_lost";
-    } else {
-      rtcStatus = "ready";
-    }
+    rtcStatus = (statusReg & 0x80) ? "time_lost" : "ready";
   }
 
   Wire.beginTransmission(DS3231_I2C_ADDR);
@@ -305,47 +416,43 @@ bool initialiseDS3231(bool verbose = true) {
 
     if (y >= 2025 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
       rtcReady = true;
-      if (rtcStatus != "time_lost") rtcStatus = "ready";
       if (verbose) {
         Serial.printf("[DS3231] OK: Hardware RTC clock valid: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
                       y, mo, d, h, m, s);
       }
-    } else {
-      if (verbose) {
-        Serial.printf("[DS3231] WARNING: RTC time out of range (%04d-%02d-%02d). Waiting for NTP sync.\n", y, mo, d);
+      // Seed ESP32 internal system time so getRtcIsoTimestamp() requires NO I2C access
+      struct tm t = {};
+      t.tm_year = y - 1900;
+      t.tm_mon = mo - 1;
+      t.tm_mday = d;
+      t.tm_hour = h;
+      t.tm_min = m;
+      t.tm_sec = s;
+      time_t epoch = mktime(&t);
+      if (epoch > 0) {
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
       }
+    } else {
       rtcReady = false;
-      if (rtcStatus == "ready") rtcStatus = "invalid_time";
+      rtcStatus = "invalid_time";
     }
   }
+
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
   return rtcReady;
 }
 
 String getRtcIsoTimestamp() {
-  Wire.beginTransmission(DS3231_I2C_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)DS3231_I2C_ADDR, (size_t)7, true) == 7) {
-    uint8_t s = bcd2dec(Wire.read() & 0x7F);
-    uint8_t m = bcd2dec(Wire.read() & 0x7F);
-    uint8_t h = bcd2dec(Wire.read() & 0x3F);
-    Wire.read();
-    uint8_t d = bcd2dec(Wire.read() & 0x3F);
-    uint8_t mo = bcd2dec(Wire.read() & 0x1F);
-    uint16_t y = 2000 + bcd2dec(Wire.read());
-
-    if (y >= 2025 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-      char buf[32];
-      snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ", y, mo, d, h, m, s);
-      return String(buf);
-    }
-  }
-
+  // Uses ESP32 monotonic clock synchronized to DS3231/NTP: 0 I2C traffic, 0 latency!
   time_t now = time(nullptr);
   if (now > 1735689600) {
     struct tm *tm_info = gmtime(&now);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
-    return String(buf);
+    if (tm_info) {
+      char buf[32];
+      strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
+      return String(buf);
+    }
   }
   return "";
 }
@@ -357,118 +464,343 @@ void syncRtcFromNtp() {
   struct tm *tm_info = gmtime(&now);
   if (!tm_info) return;
 
-  uint16_t y = tm_info->tm_year + 1900;
-  uint8_t mo = tm_info->tm_mon + 1;
-  uint8_t d = tm_info->tm_mday;
-  uint8_t h = tm_info->tm_hour;
-  uint8_t m = tm_info->tm_min;
-  uint8_t s = tm_info->tm_sec;
-  uint8_t w = tm_info->tm_wday + 1;
+  if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    uint16_t y = tm_info->tm_year + 1900;
+    uint8_t mo = tm_info->tm_mon + 1;
+    uint8_t d = tm_info->tm_mday;
+    uint8_t h = tm_info->tm_hour;
+    uint8_t m = tm_info->tm_min;
+    uint8_t s = tm_info->tm_sec;
+    uint8_t w = tm_info->tm_wday + 1;
 
-  Wire.beginTransmission(DS3231_I2C_ADDR);
-  Wire.write(0x00);
-  Wire.write(dec2bcd(s));
-  Wire.write(dec2bcd(m));
-  Wire.write(dec2bcd(h));
-  Wire.write(dec2bcd(w));
-  Wire.write(dec2bcd(d));
-  Wire.write(dec2bcd(mo));
-  Wire.write(dec2bcd((uint8_t)(y - 2000)));
-  Wire.endTransmission();
+    Wire.beginTransmission(DS3231_I2C_ADDR);
+    Wire.write(0x00);
+    Wire.write(dec2bcd(s));
+    Wire.write(dec2bcd(m));
+    Wire.write(dec2bcd(h));
+    Wire.write(dec2bcd(w));
+    Wire.write(dec2bcd(d));
+    Wire.write(dec2bcd(mo));
+    Wire.write(dec2bcd((uint8_t)(y - 2000)));
+    Wire.endTransmission();
 
-  Wire.beginTransmission(DS3231_I2C_ADDR);
-  Wire.write(0x0F);
-  Wire.write(0x00);
-  Wire.endTransmission();
+    Wire.beginTransmission(DS3231_I2C_ADDR);
+    Wire.write(0x0F);
+    Wire.write(0x00);
+    Wire.endTransmission();
 
-  rtcReady = true;
-  rtcSynced = true;
-  rtcStatus = "ready";
-  Serial.printf("[DS3231] Successfully synchronized hardware RTC from NTP: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
-                y, mo, d, h, m, s);
+    rtcReady = true;
+    rtcSynced = true;
+    rtcStatus = "ready";
+    xSemaphoreGive(i2cMutex);
+    Serial.printf("[DS3231] Successfully updated hardware RTC from NTP: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+                  y, mo, d, h, m, s);
+  }
 }
 
-// Storage Hierarchy: MicroSD Primary + LittleFS Flash Fallback
-void scanOfflineQueue();
+// ==============================================================================
+// FAST LOCAL CONDITION EVALUATION (CALLED EVERY 250 MS ON CORE 0)
+// ==============================================================================
+void fastEvaluateCondition(
+    float maxFastRms, float motorT, float ambT,
+    bool hasVib, bool hasMotor, bool hasAmb
+) {
+  uint64_t evalStartUs = esp_timer_get_time();
 
+  String evaluated = "GOOD";
+  String reason = "Normal baseline: vibration and thermal rise within nominal limits.";
+
+  if (!hasVib && !hasMotor) {
+    evaluated = "UNKNOWN";
+    reason = "Sensors offline: ADXL345 and Motor Temperature probe unavailable.";
+  } else {
+    // 1. Evaluate Vibration Severity
+    if (hasVib) {
+      if (maxFastRms >= alertThresholds.rms_critical_g) {
+        evaluated = "CRITICAL";
+        reason = String("CRITICAL: Severe vibration (Max RMS: ") + String(maxFastRms, 3) + "g >= " + String(alertThresholds.rms_critical_g, 2) + "g).";
+      } else if (maxFastRms >= alertThresholds.rms_warning_g) {
+        evaluated = "WARNING";
+        reason = String("WARNING: High vibration (Max RMS: ") + String(maxFastRms, 3) + "g >= " + String(alertThresholds.rms_warning_g, 2) + "g).";
+      } else if (maxFastRms >= alertThresholds.rms_caution_g) {
+        evaluated = "CHECK";
+        reason = String("CAUTION: Elevated vibration (Max RMS: ") + String(maxFastRms, 3) + "g).";
+      }
+    }
+
+    // 2. Evaluate Motor Temperature & Differential
+    if (hasMotor) {
+      if (motorT >= alertThresholds.motor_temp_critical_c) {
+        evaluated = "CRITICAL";
+        reason = String("CRITICAL: Stator overheating (") + String(motorT, 1) + "C).";
+      } else if (motorT >= alertThresholds.motor_temp_warning_c && evaluated != "CRITICAL") {
+        evaluated = "WARNING";
+        reason = String("WARNING: High stator temperature (") + String(motorT, 1) + "C).";
+      } else if (motorT >= alertThresholds.motor_temp_caution_c && evaluated == "GOOD") {
+        evaluated = "CHECK";
+        reason = String("CAUTION: Elevated stator temperature (") + String(motorT, 1) + "C).";
+      }
+
+      if (hasAmb) {
+        float deltaT = motorT - ambT;
+        if (deltaT >= 35.0f) {
+          evaluated = "CRITICAL";
+          reason = String("CRITICAL: Extreme thermal rise (+") + String(deltaT, 1) + "C).";
+        } else if (deltaT >= 25.0f && evaluated != "CRITICAL") {
+          evaluated = "WARNING";
+          reason = String("WARNING: Elevated thermal rise (+") + String(deltaT, 1) + "C).";
+        }
+      }
+    }
+  }
+
+  // Fast Debounce & Escalation State Machine
+  if (evaluated == "CRITICAL") {
+    // Immediate escalation on safety hazard: 0 confirmation delay
+    currentCondition = evaluated;
+    currentConditionReason = reason;
+    pendingCondition = evaluated;
+    conditionPersistenceCount = 0;
+  } else if (evaluated == pendingCondition) {
+    conditionPersistenceCount++;
+    if (conditionPersistenceCount >= CONDITION_PERSISTENCE_THRESHOLD) {
+      currentCondition = evaluated;
+      currentConditionReason = reason;
+    }
+  } else {
+    pendingCondition = evaluated;
+    conditionPersistenceCount = 1;
+  }
+
+  // Update physical LEDs immediately after condition decision
+  uint64_t ledStartUs = esp_timer_get_time();
+  updateLedOutputsImmediate();
+  perfMetrics.conditionToLedLatencyUs = (uint32_t)(esp_timer_get_time() - ledStartUs);
+  perfMetrics.fastRmsCalcDurationUs = (uint32_t)(esp_timer_get_time() - evalStartUs);
+}
+
+// ==============================================================================
+// IMMEDIATE LED OUTPUT DRIVER (TARGET: < 20 MS LATENCY AFTER CONDITION DECISION)
+// ==============================================================================
+void updateLedOutputsImmediate() {
+  uint32_t now = millis();
+
+  // Safety Override Rule: CRITICAL condition always overrides website test sequences!
+  if (currentCondition == "CRITICAL") {
+    if (activeLedTest != LED_TEST_IDLE) {
+      activeLedTest = LED_TEST_IDLE; // Abort diagnostic test immediately
+      if (activeCommandId.length() > 0) {
+        sendDeviceCommandAck(activeCommandId.c_str(), "FAILED", nullptr, "Safety override: CRITICAL vibration condition detected");
+        activeCommandId = "";
+      }
+    }
+    // 200 ms non-blocking flash across all 5 test LEDs
+    bool flashState = ((now / 200) % 2 == 0);
+    digitalWrite(PIN_TEST_LED_1, flashState ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_2, flashState ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_3, flashState ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_4, flashState ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_5, flashState ? HIGH : LOW);
+
+    // Status Red solid, Green off
+    digitalWrite(PIN_LED_RED_FAULT, HIGH);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, LOW);
+    return;
+  }
+
+  // Website Diagnostic Test Routine (If not overridden by CRITICAL)
+  if (activeLedTest == LED_TEST_RUNNING_ALL) {
+    if (now >= testStepEndMs) {
+      testCurrentLedStep++;
+      if (testCurrentLedStep >= TEST_LED_COUNT) {
+        for (size_t i = 0; i < TEST_LED_COUNT; i++) digitalWrite(TEST_LEDS[i], LOW);
+        activeLedTest = LED_TEST_IDLE;
+        sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":5}", nullptr);
+        activeCommandId = "";
+      } else {
+        for (size_t i = 0; i < TEST_LED_COUNT; i++) {
+          digitalWrite(TEST_LEDS[i], (i == testCurrentLedStep) ? HIGH : LOW);
+        }
+        testStepEndMs = now + testStepDurationMs;
+      }
+    }
+    return;
+  } else if (activeLedTest == LED_TEST_RUNNING_SINGLE) {
+    if (now >= testStepEndMs) {
+      if (activeSingleLedPin >= 0) digitalWrite(activeSingleLedPin, LOW);
+      activeLedTest = LED_TEST_IDLE;
+      sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"pulse_completed\":true}", nullptr);
+      activeCommandId = "";
+      activeSingleLedPin = -1;
+    }
+    return;
+  }
+
+  // Normal Machine-Side Local Condition Bar (Instantaneous Response)
+  if (currentCondition == "GOOD") {
+    digitalWrite(PIN_TEST_LED_1, HIGH);
+    digitalWrite(PIN_TEST_LED_2, LOW);
+    digitalWrite(PIN_TEST_LED_3, LOW);
+    digitalWrite(PIN_TEST_LED_4, LOW);
+    digitalWrite(PIN_TEST_LED_5, LOW);
+  } else if (currentCondition == "CHECK") {
+    digitalWrite(PIN_TEST_LED_1, HIGH);
+    digitalWrite(PIN_TEST_LED_2, HIGH);
+    digitalWrite(PIN_TEST_LED_3, LOW);
+    digitalWrite(PIN_TEST_LED_4, LOW);
+    digitalWrite(PIN_TEST_LED_5, LOW);
+  } else if (currentCondition == "WARNING") {
+    digitalWrite(PIN_TEST_LED_1, HIGH);
+    digitalWrite(PIN_TEST_LED_2, HIGH);
+    digitalWrite(PIN_TEST_LED_3, HIGH);
+    digitalWrite(PIN_TEST_LED_4, LOW);
+    digitalWrite(PIN_TEST_LED_5, LOW);
+  } else {
+    // UNKNOWN / Insufficient Data: slow fault pulse on LED 5
+    bool faultPulse = ((now / 500) % 2 == 0);
+    digitalWrite(PIN_TEST_LED_1, LOW);
+    digitalWrite(PIN_TEST_LED_2, LOW);
+    digitalWrite(PIN_TEST_LED_3, LOW);
+    digitalWrite(PIN_TEST_LED_4, LOW);
+    digitalWrite(PIN_TEST_LED_5, faultPulse ? HIGH : LOW);
+  }
+
+  // Status LEDs: Red (GPIO 17) & Green (GPIO 18)
+  bool networkFresh = (lastSuccessfulUploadMs > 0 && (now - lastSuccessfulUploadMs) <= 25000);
+  if (currentCondition == "WARNING") {
+    digitalWrite(PIN_LED_RED_FAULT, HIGH);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, networkFresh ? HIGH : LOW);
+  } else if (!networkFresh) {
+    digitalWrite(PIN_LED_RED_FAULT, HIGH);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, LOW);
+  } else {
+    digitalWrite(PIN_LED_RED_FAULT, LOW);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, HIGH);
+  }
+}
+
+// ==============================================================================
+// REAL-TIME HARDWARE SAMPLING TASK (CORE 0 — 200 HZ CONTINUOUS, NEVER BLOCKED)
+// ==============================================================================
+void realtimeVibrationTask(void *parameter) {
+  RollingWindowAccumulator rollingVibe;
+  FiveSecAccumulator fiveSecVibe;
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t periodTicks = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1;
+
+  uint64_t lastSampleTimeUs = esp_timer_get_time();
+  size_t fastEvalCounter = 0;
+  size_t fiveSecCounter = 0;
+
+  for (;;) {
+    uint64_t nowUs = esp_timer_get_time();
+    uint32_t intervalUs = (uint32_t)(nowUs - lastSampleTimeUs);
+    lastSampleTimeUs = nowUs;
+
+    // Track sample interval metrics
+    perfMetrics.sampleIntervalUs = intervalUs;
+    if (intervalUs > perfMetrics.maxSampleIntervalUs) perfMetrics.maxSampleIntervalUs = intervalUs;
+    if (intervalUs < perfMetrics.minSampleIntervalUs && intervalUs > 0) perfMetrics.minSampleIntervalUs = intervalUs;
+
+    uint64_t sampleStartUs = esp_timer_get_time();
+
+    if (adxlReady) {
+      float ax, ay, az;
+      if (readAcceleration(ax, ay, az)) {
+        rollingVibe.addSample(ax, ay, az);
+        fiveSecVibe.addSample(ax, ay, az);
+      } else {
+        fiveSecVibe.i2cErrors++;
+      }
+    } else {
+      fiveSecVibe.missedSlots++;
+      perfMetrics.missedSampleSlots++;
+    }
+
+    uint32_t execUs = (uint32_t)(esp_timer_get_time() - sampleStartUs);
+    perfMetrics.sampleExecDurationUs = execUs;
+    if (execUs > perfMetrics.maxSampleExecDurationUs) perfMetrics.maxSampleExecDurationUs = execUs;
+
+    fastEvalCounter++;
+    fiveSecCounter++;
+
+    // 1. FAST LOCAL CONDITION EVALUATION: Every 50 samples = 250 ms!
+    if (fastEvalCounter >= FAST_WINDOW_SAMPLES) {
+      fastEvalCounter = 0;
+
+      float fastRmsX, fastRmsY, fastRmsZ, fastMeanX, fastMeanY, fastMeanZ;
+      rollingVibe.calculateRms(fastRmsX, fastRmsY, fastRmsZ, fastMeanX, fastMeanY, fastMeanZ);
+      float fastMaxRms = fmaxf(fastRmsX, fmaxf(fastRmsY, fastRmsZ));
+      bool hasVib = (adxlReady && rollingVibe.count >= 10);
+
+      fastEvaluateCondition(
+          fastMaxRms, currentMotorTemp, currentAmbientTemp,
+          hasVib, motorTempValid, ambientTempValid
+      );
+    }
+
+    // 2. 5-SECOND TELEMETRY SNAPSHOT DISPATCH: Every 1000 samples = 5.0 seconds!
+    if (fiveSecCounter >= 1000) {
+      fiveSecCounter = 0;
+
+      TelemetrySnapshot snap;
+      snap.sampleCount = fiveSecVibe.sampleCount;
+      snap.missedSlots = fiveSecVibe.missedSlots;
+      snap.i2cErrors = fiveSecVibe.i2cErrors;
+      snap.hasVibration = (adxlReady && snap.sampleCount >= 10);
+
+      if (snap.hasVibration) {
+        snap.meanX = (float)(fiveSecVibe.sumX / snap.sampleCount);
+        snap.meanY = (float)(fiveSecVibe.sumY / snap.sampleCount);
+        snap.meanZ = (float)(fiveSecVibe.sumZ / snap.sampleCount);
+
+        double varX = (fiveSecVibe.sumSqX / snap.sampleCount) - ((double)snap.meanX * snap.meanX);
+        double varY = (fiveSecVibe.sumSqY / snap.sampleCount) - ((double)snap.meanY * snap.meanY);
+        double varZ = (fiveSecVibe.sumSqZ / snap.sampleCount) - ((double)snap.meanZ * snap.meanZ);
+
+        snap.rmsX = sqrtf(fmaxf(0.0f, (float)varX));
+        snap.rmsY = sqrtf(fmaxf(0.0f, (float)varY));
+        snap.rmsZ = sqrtf(fmaxf(0.0f, (float)varZ));
+      } else {
+        snap.meanX = snap.meanY = snap.meanZ = 0.0f;
+        snap.rmsX = snap.rmsY = snap.rmsZ = 0.0f;
+      }
+
+      snap.acquisitionQuality = snap.hasVibration ? fminf(1.0f, (float)snap.sampleCount / 1000.0f) : 0.0f;
+      snap.motorTemp = currentMotorTemp;
+      snap.ambientTemp = currentAmbientTemp;
+      snap.hasMotorTemp = motorTempValid;
+      snap.hasAmbientTemp = ambientTempValid;
+      snap.timestampSec = (uint32_t)time(nullptr);
+      strncpy(snap.conditionStatus, currentCondition.c_str(), sizeof(snap.conditionStatus) - 1);
+      strncpy(snap.conditionReason, currentConditionReason.c_str(), sizeof(snap.conditionReason) - 1);
+
+      // Dispatch to background queue without blocking Core 0
+      if (telemetrySnapshotQueue) {
+        if (xQueueSend(telemetrySnapshotQueue, &snap, 0) != pdTRUE) {
+          perfMetrics.queueOverflowCount++;
+        }
+      }
+
+      fiveSecVibe.reset();
+    }
+
+    // Refresh LED blink/flash states continuously
+    updateLedOutputsImmediate();
+
+    perfMetrics.realtimeTaskStackWatermark = uxTaskGetStackHighWaterMark(nullptr);
+
+    vTaskDelayUntil(&lastWakeTime, periodTicks);
+  }
+}
+
+// ==============================================================================
+// STORAGE SUBSYSTEM: MICROSD PRIMARY + LITTLEFS FLASH FALLBACK
+// ==============================================================================
 float calculateStorageUsage(uint64_t totalBytes, uint64_t usedBytes) {
   if (totalBytes == 0) return 0.0f;
   return ((float)usedBytes * 100.0f) / (float)totalBytes;
-}
-
-bool initialiseLittleFSFallback() {
-  if (LittleFS.begin(true)) {
-    littleFsReady = true;
-    uint64_t total = LittleFS.totalBytes();
-    uint64_t used = LittleFS.usedBytes();
-    storageUsedPct = calculateStorageUsage(total, used);
-    storageMedium = "flash_littlefs";
-
-    if (!LittleFS.exists("/lfs_queue")) {
-      LittleFS.mkdir("/lfs_queue");
-    }
-    Serial.printf("[LittleFS] OK: Bounded internal flash fallback mounted (Total: %llu KB, Used: %.1f%%)\n",
-                  total / 1024, storageUsedPct);
-    return true;
-  }
-  Serial.println("[LittleFS] ERROR: Flash fallback mount failed.");
-  littleFsReady = false;
-  return false;
-}
-
-bool initialiseSDCard(bool verbose = true) {
-  spiSD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-  pinMode(PIN_SD_CS, OUTPUT);
-  digitalWrite(PIN_SD_CS, HIGH);
-
-  if (!SD.begin(PIN_SD_CS, spiSD, SD_SPI_SPEED_HZ)) {
-    if (verbose) {
-      Serial.printf("[SD] WARNING: MicroSD mount failed on CS GPIO %d. Activating LittleFS flash fallback.\n", PIN_SD_CS);
-    }
-    sdCardReady = false;
-    sdCardStatus = "missing";
-    initialiseLittleFSFallback();
-    scanOfflineQueue();
-    return false;
-  }
-
-  uint8_t cardType = SD.cardType();
-  if (cardType == CARD_NONE) {
-    if (verbose) Serial.println("[SD] WARNING: No SD card attached. Activating LittleFS flash fallback.");
-    sdCardReady = false;
-    sdCardStatus = "missing";
-    initialiseLittleFSFallback();
-    scanOfflineQueue();
-    return false;
-  }
-
-  sdCardReady = true;
-  sdCardStatus = "ready";
-  storageMedium = "sd_card";
-
-  uint64_t totalBytes = SD.totalBytes();
-  uint64_t usedBytes = SD.usedBytes();
-  storageUsedPct = calculateStorageUsage(totalBytes, usedBytes);
-
-  if (verbose) {
-    Serial.printf("[SD] OK: MicroSD mounted (Capacity: %llu MB | Used: %.2f%%)\n",
-                  totalBytes / (1024 * 1024), storageUsedPct);
-  }
-
-  if (!SD.exists("/queue")) {
-    SD.mkdir("/queue");
-  }
-
-  if (!SD.exists("/telemetry.csv")) {
-    File logFile = SD.open("/telemetry.csv", FILE_WRITE);
-    if (logFile) {
-      logFile.println("record_id,measured_at,motor_temp_c,ambient_temp_c,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi,condition_status,storage_medium,storage_used_pct,synced");
-      logFile.close();
-    }
-  }
-
-  scanOfflineQueue();
-  return true;
 }
 
 void scanOfflineQueue() {
@@ -489,9 +821,7 @@ void scanOfflineQueue() {
       }
       dir.close();
     }
-    uint64_t total = SD.totalBytes();
-    uint64_t used = SD.usedBytes();
-    storageUsedPct = calculateStorageUsage(total, used);
+    storageUsedPct = calculateStorageUsage(SD.totalBytes(), SD.usedBytes());
     storageMedium = "sd_card";
   } else if (littleFsReady) {
     File dir = LittleFS.open("/lfs_queue");
@@ -507,9 +837,7 @@ void scanOfflineQueue() {
       }
       dir.close();
     }
-    uint64_t total = LittleFS.totalBytes();
-    uint64_t used = LittleFS.usedBytes();
-    storageUsedPct = calculateStorageUsage(total, used);
+    storageUsedPct = calculateStorageUsage(LittleFS.totalBytes(), LittleFS.usedBytes());
     storageMedium = "flash_littlefs";
   } else {
     storageMedium = "none";
@@ -520,15 +848,72 @@ void scanOfflineQueue() {
   oldestUnsyncedTimestamp = oldest;
 }
 
-// Storage Headroom Protection (90% limit ceiling rule)
-bool enforceStorageCeilingPolicy() {
-  if (storageUsedPct < STORAGE_CEILING_LIMIT_PCT) {
-    return true; // Headroom sufficient
+bool initialiseLittleFSFallback() {
+  if (LittleFS.begin(true)) {
+    littleFsReady = true;
+    storageUsedPct = calculateStorageUsage(LittleFS.totalBytes(), LittleFS.usedBytes());
+    storageMedium = "flash_littlefs";
+
+    if (!LittleFS.exists("/lfs_queue")) {
+      LittleFS.mkdir("/lfs_queue");
+    }
+    Serial.printf("[LittleFS] OK: Bounded internal flash mounted (Used: %.1f%%)\n", storageUsedPct);
+    return true;
+  }
+  littleFsReady = false;
+  return false;
+}
+
+bool initialiseSDCard(bool verbose = true) {
+  spiSD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+
+  if (!SD.begin(PIN_SD_CS, spiSD, SD_SPI_SPEED_HZ)) {
+    if (verbose) Serial.printf("[SD] WARNING: MicroSD mount failed on CS %d. Using LittleFS.\n", PIN_SD_CS);
+    sdCardReady = false;
+    sdCardStatus = "missing";
+    initialiseLittleFSFallback();
+    scanOfflineQueue();
+    return false;
   }
 
-  Serial.printf("[STORAGE-ALERT] Storage usage reached %.2f%% (>= 90%% ceiling). Applying retention pruning.\n", storageUsedPct);
+  if (SD.cardType() == CARD_NONE) {
+    if (verbose) Serial.println("[SD] WARNING: No card attached. Using LittleFS.");
+    sdCardReady = false;
+    sdCardStatus = "missing";
+    initialiseLittleFSFallback();
+    scanOfflineQueue();
+    return false;
+  }
 
-  // Attempt pruning oldest queue files first
+  sdCardReady = true;
+  sdCardStatus = "ready";
+  storageMedium = "sd_card";
+  storageUsedPct = calculateStorageUsage(SD.totalBytes(), SD.usedBytes());
+
+  if (verbose) {
+    Serial.printf("[SD] OK: MicroSD mounted (Used: %.2f%%)\n", storageUsedPct);
+  }
+
+  if (!SD.exists("/queue")) SD.mkdir("/queue");
+  if (!SD.exists("/telemetry.csv")) {
+    File logFile = SD.open("/telemetry.csv", FILE_WRITE);
+    if (logFile) {
+      logFile.println("record_id,measured_at,motor_temp_c,ambient_temp_c,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi,condition_status,storage_medium,storage_used_pct,synced");
+      logFile.close();
+    }
+  }
+
+  scanOfflineQueue();
+  return true;
+}
+
+bool enforceStorageCeilingPolicy() {
+  if (storageUsedPct < STORAGE_CEILING_LIMIT_PCT) return true;
+
+  Serial.printf("[STORAGE-ALERT] Storage reached %.2f%% (>= 90%% ceiling). Pruning oldest records.\n", storageUsedPct);
+
   if (sdCardReady) {
     File dir = SD.open("/queue");
     if (dir && dir.isDirectory()) {
@@ -538,7 +923,6 @@ bool enforceStorageCeilingPolicy() {
         entry.close();
         dir.close();
         SD.remove(path.c_str());
-        Serial.printf("[RETENTION] Pruned oldest queue record %s to protect filesystem headroom.\n", path.c_str());
         scanOfflineQueue();
         return (storageUsedPct < STORAGE_CEILING_LIMIT_PCT);
       }
@@ -553,7 +937,6 @@ bool enforceStorageCeilingPolicy() {
         entry.close();
         dir.close();
         LittleFS.remove(path.c_str());
-        Serial.printf("[RETENTION] Pruned oldest flash record %s to protect headroom.\n", path.c_str());
         scanOfflineQueue();
         return (storageUsedPct < STORAGE_CEILING_LIMIT_PCT);
       }
@@ -561,18 +944,14 @@ bool enforceStorageCeilingPolicy() {
     }
   }
 
-  // If storage is still >= 90%, increment dropped records counter
   droppedRecordsCount++;
-  Serial.printf("[STORAGE-ERROR] Bounded storage exhausted (%.2f%%). Record discarded to preserve device stability. Total dropped: %u\n",
-                storageUsedPct, droppedRecordsCount);
   return false;
 }
 
 bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
-  // Check 90% storage limit ceiling
-  if (!enforceStorageCeilingPolicy()) {
-    return false; // Record dropped per non-negotiable requirement
-  }
+  if (!enforceStorageCeilingPolicy()) return false;
+
+  uint64_t sdStart = esp_timer_get_time();
 
   if (sdCardReady) {
     String filename = String("/queue/rec_") + recordId + ".json";
@@ -581,9 +960,9 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
       f.print(jsonPayload);
       f.close();
       unsyncedRecordsCount++;
+      perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
       return true;
     }
-    Serial.println("[SD] Write error on queue write. Attempting LittleFS fallback.");
     sdCardStatus = "write_error";
     if (!littleFsReady) initialiseLittleFSFallback();
   }
@@ -596,6 +975,7 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
       f.close();
       unsyncedRecordsCount++;
       storageMedium = "flash_littlefs";
+      perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
       return true;
     }
   }
@@ -610,11 +990,12 @@ bool appendTelemetryToCsv(
     bool hasAmbient, float ambientTemp,
     bool hasVibration, float rmsX, float rmsY, float rmsZ,
     uint32_t sampleCount, float quality,
-    int wifiRssi, const String &condStatus, const String &stgMedium, float stgUsed,
+    int wifiRssi, const char *condStatus, const String &stgMedium, float stgUsed,
     bool synced
 ) {
   if (!sdCardReady) return false;
 
+  uint64_t sdStart = esp_timer_get_time();
   File f = SD.open("/telemetry.csv", FILE_APPEND);
   if (!f) {
     sdCardStatus = "write_error";
@@ -626,193 +1007,40 @@ bool appendTelemetryToCsv(
   if (hasAmbient) f.printf("%.2f,", ambientTemp); else f.print(",");
   if (hasVibration) f.printf("%.4f,%.4f,%.4f,", rmsX, rmsY, rmsZ); else f.print(",,,");
   f.printf("%u,%.2f,%d,%s,%s,%.1f,%s\n",
-           sampleCount, quality, wifiRssi, condStatus.c_str(), stgMedium.c_str(), stgUsed, synced ? "1" : "0");
+           sampleCount, quality, wifiRssi, condStatus, stgMedium.c_str(), stgUsed, synced ? "1" : "0");
   f.close();
+  perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
   return true;
 }
 
-// Local Condition Classification Engine
-void evaluateMotorCondition(
-    float maxRms, float motorT, float ambT,
-    bool hasVib, bool hasMotor, bool hasAmb
-) {
-  String evaluated = "GOOD";
-  String reason = "Normal baseline: vibration and thermal rise within nominal limits.";
-
-  if (!hasVib && !hasMotor) {
-    evaluated = "UNKNOWN";
-    reason = "Sensors offline: ADXL345 and Motor Temperature probe unavailable.";
-  } else {
-    // 1. Evaluate Vibration
-    if (hasVib) {
-      if (maxRms >= alertThresholds.rms_critical_g) {
-        evaluated = "CRITICAL";
-        reason = String("CRITICAL: Severe vibration detected (Max RMS: ") + String(maxRms, 3) + "g >= " + String(alertThresholds.rms_critical_g, 2) + "g). Immediate shutdown advised.";
-      } else if (maxRms >= alertThresholds.rms_warning_g) {
-        evaluated = "WARNING";
-        reason = String("WARNING: High vibration detected (Max RMS: ") + String(maxRms, 3) + "g >= " + String(alertThresholds.rms_warning_g, 2) + "g). Inspection required.";
-      } else if (maxRms >= alertThresholds.rms_caution_g) {
-        evaluated = "CHECK";
-        reason = String("CAUTION: Elevated vibration (Max RMS: ") + String(maxRms, 3) + "g). Monitor bearing wear.";
-      }
-    }
-
-    // 2. Evaluate Motor Temperature & Thermal Rise
-    if (hasMotor) {
-      if (motorT >= alertThresholds.motor_temp_critical_c) {
-        evaluated = "CRITICAL";
-        reason = String("CRITICAL: Stator overheating (") + String(motorT, 1) + "C >= " + String(alertThresholds.motor_temp_critical_c, 1) + "C).";
-      } else if (motorT >= alertThresholds.motor_temp_warning_c && evaluated != "CRITICAL") {
-        evaluated = "WARNING";
-        reason = String("WARNING: High stator temperature (") + String(motorT, 1) + "C).";
-      } else if (motorT >= alertThresholds.motor_temp_caution_c && evaluated == "GOOD") {
-        evaluated = "CHECK";
-        reason = String("CAUTION: Motor temperature elevated (") + String(motorT, 1) + "C).";
-      }
-
-      if (hasAmb) {
-        float deltaT = motorT - ambT;
-        if (deltaT >= 35.0f) {
-          evaluated = "CRITICAL";
-          reason = String("CRITICAL: Extreme thermal rise (+") + String(deltaT, 1) + "C above ambient).";
-        } else if (deltaT >= 25.0f && evaluated != "CRITICAL") {
-          evaluated = "WARNING";
-          reason = String("WARNING: Elevated thermal rise (+") + String(deltaT, 1) + "C above ambient).";
-        }
-      }
-    }
-  }
-
-  // Hysteresis / Debounce logic to prevent chatter
-  if (evaluated == pendingCondition) {
-    conditionPersistenceCount++;
-    if (conditionPersistenceCount >= CONDITION_PERSISTENCE_THRESHOLD) {
-      currentCondition = evaluated;
-      currentConditionReason = reason;
-    }
-  } else {
-    pendingCondition = evaluated;
-    conditionPersistenceCount = 1;
-    // Immediate escalation on critical condition
-    if (evaluated == "CRITICAL") {
-      currentCondition = evaluated;
-      currentConditionReason = reason;
-    }
-  }
-}
-
-// LED Indicators State Machine
-void updateLedIndicators() {
-  uint32_t now = millis();
-
-  // 1. If an explicit website command test sequence is running, execute it non-blocking
-  if (activeLedTest == LED_TEST_RUNNING_ALL) {
-    if (now >= testStepEndMs) {
-      testCurrentLedStep++;
-      if (testCurrentLedStep >= TEST_LED_COUNT) {
-        // Finished chaser
-        for (size_t i = 0; i < TEST_LED_COUNT; i++) digitalWrite(TEST_LEDS[i], LOW);
-        activeLedTest = LED_TEST_IDLE;
-        sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":5}", nullptr);
-        activeCommandId = "";
-      } else {
-        // Light current step LED only
-        for (size_t i = 0; i < TEST_LED_COUNT; i++) {
-          digitalWrite(TEST_LEDS[i], (i == testCurrentLedStep) ? HIGH : LOW);
-        }
-        testStepEndMs = now + testStepDurationMs;
-      }
-    }
-    return;
-  } else if (activeLedTest == LED_TEST_RUNNING_SINGLE) {
-    if (now >= testStepEndMs) {
-      if (activeSingleLedPin >= 0) digitalWrite(activeSingleLedPin, LOW);
-      activeLedTest = LED_TEST_IDLE;
-      sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"pulse_completed\":true}", nullptr);
-      activeCommandId = "";
-      activeSingleLedPin = -1;
-    }
-    return;
-  }
-
-  // 2. Normal Machine-Side Indication: 5 Test LEDs act as Vibration / Condition Bar Meter
-  if (currentCondition == "GOOD") {
-    digitalWrite(PIN_TEST_LED_1, HIGH);
-    digitalWrite(PIN_TEST_LED_2, LOW);
-    digitalWrite(PIN_TEST_LED_3, LOW);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
-  } else if (currentCondition == "CHECK") {
-    digitalWrite(PIN_TEST_LED_1, HIGH);
-    digitalWrite(PIN_TEST_LED_2, HIGH);
-    digitalWrite(PIN_TEST_LED_3, LOW);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
-  } else if (currentCondition == "WARNING") {
-    digitalWrite(PIN_TEST_LED_1, HIGH);
-    digitalWrite(PIN_TEST_LED_2, HIGH);
-    digitalWrite(PIN_TEST_LED_3, HIGH);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
-  } else if (currentCondition == "CRITICAL") {
-    // 200 ms non-blocking flash on all LEDs
-    bool flashState = ((now / 200) % 2 == 0);
-    digitalWrite(PIN_TEST_LED_1, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_2, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_3, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_4, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_5, flashState ? HIGH : LOW);
-  } else {
-    // UNKNOWN / Insufficient Data: LED 5 pulses slowly (1 sec period)
-    bool faultPulse = ((now / 500) % 2 == 0);
-    digitalWrite(PIN_TEST_LED_1, LOW);
-    digitalWrite(PIN_TEST_LED_2, LOW);
-    digitalWrite(PIN_TEST_LED_3, LOW);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, faultPulse ? HIGH : LOW);
-  }
-
-  // 3. Status LEDs: Red (GPIO 17) & Green (GPIO 18)
-  bool networkFresh = (lastSuccessfulUploadMs > 0 && (now - lastSuccessfulUploadMs) <= 25000);
-  if (currentCondition == "CRITICAL" || currentCondition == "WARNING" || !networkFresh) {
-    digitalWrite(PIN_LED_RED_FAULT, HIGH);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, networkFresh && currentCondition != "CRITICAL" ? HIGH : LOW);
-  } else {
-    digitalWrite(PIN_LED_RED_FAULT, LOW);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, HIGH);
-  }
-}
-
-// Temperature Sensors
+// ==============================================================================
+// ASYNCHRONOUS TEMPERATURE & BACKGROUND SENSING
+// ==============================================================================
 void discoverTemperatureProbes(bool verbose = true) {
   sensorMotor.begin();
-  uint8_t countMotor = sensorMotor.getDeviceCount();
-  if (countMotor > 0 && sensorMotor.getAddress(motorProbeAddress, 0)) {
+  if (sensorMotor.getDeviceCount() > 0 && sensorMotor.getAddress(motorProbeAddress, 0)) {
     sensorMotor.setResolution(motorProbeAddress, 12);
     sensorMotor.setWaitForConversion(false);
     motorProbeFound = true;
-    if (verbose) Serial.println("[DS18B20-MOTOR] OK: Motor stator temperature probe found on GPIO 10.");
+    if (verbose) Serial.println("[DS18B20-MOTOR] OK: Motor probe detected on GPIO 10.");
   } else {
     motorProbeFound = false;
     motorTempValid = false;
-    if (verbose) Serial.println("[DS18B20-MOTOR] WARNING: No probe found on GPIO 10.");
   }
 
   sensorAmbient.begin();
-  uint8_t countAmb = sensorAmbient.getDeviceCount();
-  if (countAmb > 0 && sensorAmbient.getAddress(ambientProbeAddress, 0)) {
+  if (sensorAmbient.getDeviceCount() > 0 && sensorAmbient.getAddress(ambientProbeAddress, 0)) {
     sensorAmbient.setResolution(ambientProbeAddress, 12);
     sensorAmbient.setWaitForConversion(false);
     ambientProbeFound = true;
-    if (verbose) Serial.println("[DS18B20-AMBIENT] OK: Ambient room temperature probe found on GPIO 11.");
+    if (verbose) Serial.println("[DS18B20-AMBIENT] OK: Ambient probe detected on GPIO 11.");
   } else {
     ambientProbeFound = false;
     ambientTempValid = false;
-    if (verbose) Serial.println("[DS18B20-AMBIENT] WARNING: No probe found on GPIO 11.");
   }
 }
 
-void updateTemperatures() {
+void updateTemperaturesAsync() {
   uint32_t now = millis();
 
   if (!tempConversionPending) {
@@ -861,17 +1089,20 @@ void checkSensorRecovery() {
   if (!sdCardReady) initialiseSDCard(false);
 }
 
-// Wi-Fi Management
+// ==============================================================================
+// NON-BLOCKING WI-FI WITH EXPONENTIAL BACKOFF
+// ==============================================================================
 void startWiFiConnection() {
   if (WiFi.status() == WL_CONNECTED) return;
-  Serial.printf("[WIFI] Connecting to SSID: %s ...\n", WIFI_SSID);
+  Serial.printf("[WIFI] Connecting to SSID: %s (non-blocking)...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWiFiAttemptMs = millis();
 }
 
-void maintainWiFi() {
+void maintainWiFiAsync() {
   if (WiFi.status() == WL_CONNECTED) {
+    wifiBackoffMs = 5000; // Reset backoff upon successful connection
     if (!rtcSynced && (millis() - lastNtpAttemptMs > 60000)) {
       lastNtpAttemptMs = millis();
       configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -881,16 +1112,22 @@ void maintainWiFi() {
   }
 
   uint32_t now = millis();
-  if (now - lastWiFiAttemptMs >= 10000) {
+  if (now - lastWiFiAttemptMs >= wifiBackoffMs) {
     lastWiFiAttemptMs = now;
-    Serial.println("[WIFI] Reconnecting Wi-Fi in background...");
+    Serial.printf("[WIFI] Reconnecting (backoff: %u ms)...\n", wifiBackoffMs);
     WiFi.disconnect();
     WiFi.reconnect();
+    // Bounded exponential backoff up to 60s
+    wifiBackoffMs = (wifiBackoffMs * 2 > 60000) ? 60000 : wifiBackoffMs * 2;
   }
 }
 
-// HTTPS Telemetry Transmission
+// ==============================================================================
+// HTTPS TELEMETRY & COMMAND PIPELINE (BACKGROUND CORE 1)
+// ==============================================================================
 int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
+  uint64_t uploadStartUs = esp_timer_get_time();
+
   WiFiClientSecure client;
   client.setCACert(VERCEL_ROOT_CA_CERT);
 
@@ -907,10 +1144,11 @@ int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
     responseBody = http.errorToString(httpCode);
   }
   http.end();
+
+  perfMetrics.lastUploadDurationMs = (uint32_t)((esp_timer_get_time() - uploadStartUs) / 1000);
   return httpCode;
 }
 
-// Two-Way Command Acknowledgment Transmission
 void sendDeviceCommandAck(const char *commandId, const char *status, const char *resultJson, const char *errorMessage) {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -945,16 +1183,13 @@ void sendDeviceCommandAck(const char *commandId, const char *status, const char 
 
   String ackPayload;
   serializeJson(ackDoc, ackPayload);
-
-  int httpCode = http.POST(ackPayload);
-  Serial.printf("[COMMAND-ACK] Dispatched ACK for %s (Status: %s, HTTP: %d)\n", commandId, status, httpCode);
+  http.POST(ackPayload);
   http.end();
 }
 
-// Two-Way Command Polling
 void pollDeviceCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (activeLedTest != LED_TEST_IDLE) return; // Do not interrupt running test
+  if (activeLedTest != LED_TEST_IDLE) return;
 
   WiFiClientSecure client;
   client.setCACert(VERCEL_ROOT_CA_CERT);
@@ -983,7 +1218,7 @@ void pollDeviceCommands() {
         const char *cmdType = cmd["command_type"];
         JsonObject params = cmd["parameters"];
 
-        Serial.printf("[COMMAND-RECEIVED] Executing Command: %s (Type: %s)\n", cmdId, cmdType);
+        Serial.printf("[COMMAND] Processing: %s (%s)\n", cmdId, cmdType);
 
         if (strcmp(cmdType, "LED_TEST_ALL") == 0) {
           activeCommandId = String(cmdId);
@@ -991,47 +1226,70 @@ void pollDeviceCommands() {
           testCurrentLedStep = 0;
           testStepDurationMs = params["step_duration_ms"] | 500;
           testStepEndMs = millis() + testStepDurationMs;
-          // Set first LED immediately
           for (size_t i = 0; i < TEST_LED_COUNT; i++) {
             digitalWrite(TEST_LEDS[i], (i == 0) ? HIGH : LOW);
           }
           sendDeviceCommandAck(cmdId, "EXECUTING", "{\"state\":\"running_all\"}", nullptr);
-          break; // Process one active LED sequence at a time
+          break;
         } else if (strcmp(cmdType, "LED_TEST_SINGLE") == 0) {
-          int ledIdx = params["led_index"] | 1;
-          uint32_t dur = params["duration_ms"] | 2000;
-          if (ledIdx >= 1 && ledIdx <= 5) {
+          int ledIndex = params["led_index"] | 1;
+          if (ledIndex >= 1 && ledIndex <= 5) {
             activeCommandId = String(cmdId);
             activeLedTest = LED_TEST_RUNNING_SINGLE;
-            activeSingleLedPin = TEST_LEDS[ledIdx - 1];
-            testStepDurationMs = dur;
-            testStepEndMs = millis() + dur;
-            for (size_t i = 0; i < TEST_LED_COUNT; i++) digitalWrite(TEST_LEDS[i], LOW);
-            digitalWrite(activeSingleLedPin, HIGH);
+            activeSingleLedPin = TEST_LEDS[ledIndex - 1];
+            testStepDurationMs = params["duration_ms"] | 1000;
+            testStepEndMs = millis() + testStepDurationMs;
+            for (size_t i = 0; i < TEST_LED_COUNT; i++) {
+              digitalWrite(TEST_LEDS[i], (TEST_LEDS[i] == activeSingleLedPin) ? HIGH : LOW);
+            }
             sendDeviceCommandAck(cmdId, "EXECUTING", "{\"state\":\"pulsing_single\"}", nullptr);
             break;
           } else {
-            sendDeviceCommandAck(cmdId, "FAILED", nullptr, "Invalid led_index. Permitted: 1..5");
+            sendDeviceCommandAck(cmdId, "FAILED", nullptr, "Invalid led_index. Must be 1 to 5.");
           }
+        } else if (strcmp(cmdType, "STATUS_REQUEST") == 0) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+          JsonDocument statusRes;
+#else
+          StaticJsonDocument<512> statusRes;
+#endif
+          statusRes["uptime_s"] = millis() / 1000;
+          statusRes["condition"] = currentCondition;
+          statusRes["sample_interval_us"] = perfMetrics.sampleIntervalUs;
+          statusRes["fast_rms_calc_us"] = perfMetrics.fastRmsCalcDurationUs;
+          statusRes["condition_to_led_us"] = perfMetrics.conditionToLedLatencyUs;
+          statusRes["upload_duration_ms"] = perfMetrics.lastUploadDurationMs;
+          statusRes["sd_write_ms"] = perfMetrics.lastSdWriteDurationMs;
+          statusRes["missed_slots"] = perfMetrics.missedSampleSlots;
+          statusRes["core0_stack_free"] = perfMetrics.realtimeTaskStackWatermark;
+
+          String resJson;
+          serializeJson(statusRes, resJson);
+          sendDeviceCommandAck(cmdId, "SUCCEEDED", resJson.c_str(), nullptr);
+        } else if (strcmp(cmdType, "SENSOR_DIAGNOSTIC") == 0) {
+          bool adxl = initialiseADXL345(false);
+          sendDeviceCommandAck(cmdId, "SUCCEEDED", adxl ? "{\"adxl345\":\"ready\"}" : "{\"adxl345\":\"error\"}", nullptr);
+        } else if (strcmp(cmdType, "SYNC_STATUS_REQUEST") == 0) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+          JsonDocument syncRes;
+#else
+          StaticJsonDocument<256> syncRes;
+#endif
+          syncRes["storage_medium"] = storageMedium;
+          syncRes["storage_used_pct"] = storageUsedPct;
+          syncRes["unsynced_count"] = unsyncedRecordsCount;
+          syncRes["dropped_count"] = droppedRecordsCount;
+          String resJson;
+          serializeJson(syncRes, resJson);
+          sendDeviceCommandAck(cmdId, "SUCCEEDED", resJson.c_str(), nullptr);
         } else if (strcmp(cmdType, "SET_ALERT_THRESHOLDS") == 0) {
-          if (params.containsKey("motor_temp_caution_c")) alertThresholds.motor_temp_caution_c = params["motor_temp_caution_c"];
-          if (params.containsKey("motor_temp_warning_c")) alertThresholds.motor_temp_warning_c = params["motor_temp_warning_c"];
-          if (params.containsKey("motor_temp_critical_c")) alertThresholds.motor_temp_critical_c = params["motor_temp_critical_c"];
-          if (params.containsKey("rms_caution_g")) alertThresholds.rms_caution_g = params["rms_caution_g"];
           if (params.containsKey("rms_warning_g")) alertThresholds.rms_warning_g = params["rms_warning_g"];
           if (params.containsKey("rms_critical_g")) alertThresholds.rms_critical_g = params["rms_critical_g"];
-          Serial.println("[COMMAND] Updated alert thresholds successfully.");
+          if (params.containsKey("motor_temp_warning_c")) alertThresholds.motor_temp_warning_c = params["motor_temp_warning_c"];
+          if (params.containsKey("motor_temp_critical_c")) alertThresholds.motor_temp_critical_c = params["motor_temp_critical_c"];
           sendDeviceCommandAck(cmdId, "SUCCEEDED", "{\"thresholds_updated\":true}", nullptr);
-        } else if (strcmp(cmdType, "SENSOR_DIAGNOSTIC") == 0 || strcmp(cmdType, "STATUS_REQUEST") == 0) {
-          String resJson = String("{\"adxl345\":\"") + (adxlReady ? "ready" : "offline") +
-                           "\",\"motor_temp\":\"" + (motorTempValid ? "ready" : "offline") +
-                           "\",\"ambient_temp\":\"" + (ambientTempValid ? "ready" : "offline") +
-                           "\",\"rtc\":\"" + rtcStatus +
-                           "\",\"storage\":\"" + storageMedium +
-                           "\",\"condition\":\"" + currentCondition + "\"}";
-          sendDeviceCommandAck(cmdId, "SUCCEEDED", resJson.c_str(), nullptr);
         } else {
-          sendDeviceCommandAck(cmdId, "FAILED", nullptr, "Unsupported or unpermitted command type");
+          sendDeviceCommandAck(cmdId, "FAILED", nullptr, "Unsupported command_type");
         }
       }
     }
@@ -1039,15 +1297,11 @@ void pollDeviceCommands() {
   http.end();
 }
 
-// Backlog Offline Queue Processing
 void processBacklogQueue() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (unsyncedRecordsCount == 0) return;
-
   uint32_t now = millis();
   if (now < nextBacklogUploadAttemptMs) return;
 
-  // Process from SD queue if available
   if (sdCardReady) {
     File dir = SD.open("/queue");
     if (!dir || !dir.isDirectory()) return;
@@ -1061,24 +1315,19 @@ void processBacklogQueue() {
 
     String path = String("/queue/") + entry.name();
     String content = "";
-    while (entry.available()) {
-      content += (char)entry.read();
-    }
+    while (entry.available()) content += (char)entry.read();
     entry.close();
     dir.close();
 
     if (content.length() > 0) {
-      String responseStr;
-      int httpCode = sendTelemetryPayload(content, responseStr);
+      String resStr;
+      int httpCode = sendTelemetryPayload(content, resStr);
       if (httpCode >= 200 && httpCode < 300) {
         SD.remove(path.c_str());
         if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        Serial.printf("[SD-DRAIN] Successfully synced buffered record %s (Remaining: %u)\n",
-                      path.c_str(), unsyncedRecordsCount);
-        nextBacklogUploadAttemptMs = now + 400; // Small delay between drain batches
+        nextBacklogUploadAttemptMs = now + 400;
         return;
       } else {
-        Serial.printf("[SD-DRAIN] Failed to sync %s (HTTP %d). Retrying later.\n", path.c_str(), httpCode);
         nextBacklogUploadAttemptMs = now + 5000;
         return;
       }
@@ -1096,20 +1345,16 @@ void processBacklogQueue() {
 
     String path = String("/lfs_queue/") + entry.name();
     String content = "";
-    while (entry.available()) {
-      content += (char)entry.read();
-    }
+    while (entry.available()) content += (char)entry.read();
     entry.close();
     dir.close();
 
     if (content.length() > 0) {
-      String responseStr;
-      int httpCode = sendTelemetryPayload(content, responseStr);
+      String resStr;
+      int httpCode = sendTelemetryPayload(content, resStr);
       if (httpCode >= 200 && httpCode < 300) {
         LittleFS.remove(path.c_str());
         if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        Serial.printf("[FLASH-DRAIN] Successfully synced flash record %s (Remaining: %u)\n",
-                      path.c_str(), unsyncedRecordsCount);
         nextBacklogUploadAttemptMs = now + 400;
         return;
       } else {
@@ -1120,63 +1365,14 @@ void processBacklogQueue() {
   }
 }
 
-// 5-Second Telemetry Packaging and Reporting
-void reportTelemetry() {
-  VibrationAccumulator snapshot;
-  if (xSemaphoreTake(vibrationMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    snapshot = liveVibration;
-    liveVibration.sumX = 0;
-    liveVibration.sumY = 0;
-    liveVibration.sumZ = 0;
-    liveVibration.sumSqX = 0;
-    liveVibration.sumSqY = 0;
-    liveVibration.sumSqZ = 0;
-    liveVibration.sampleCount = 0;
-    liveVibration.i2cErrors = 0;
-    liveVibration.missedSlots = 0;
-    xSemaphoreGive(vibrationMutex);
-  }
-
-  float meanX = 0, meanY = 0, meanZ = 0;
-  float rmsX = 0, rmsY = 0, rmsZ = 0;
-  float maxRms = 0;
-  bool hasVibration = (adxlReady && snapshot.sampleCount >= 10);
-
-  if (hasVibration) {
-    meanX = snapshot.sumX / snapshot.sampleCount;
-    meanY = snapshot.sumY / snapshot.sampleCount;
-    meanZ = snapshot.sumZ / snapshot.sampleCount;
-
-    double varX = (snapshot.sumSqX / snapshot.sampleCount) - ((double)meanX * meanX);
-    double varY = (snapshot.sumSqY / snapshot.sampleCount) - ((double)meanY * meanY);
-    double varZ = (snapshot.sumSqZ / snapshot.sampleCount) - ((double)meanZ * meanZ);
-
-    rmsX = sqrtf(fmaxf(0.0f, (float)varX));
-    rmsY = sqrtf(fmaxf(0.0f, (float)varY));
-    rmsZ = sqrtf(fmaxf(0.0f, (float)varZ));
-    maxRms = fmaxf(rmsX, fmaxf(rmsY, rmsZ));
-  }
-
-  uint32_t expectedSamples = (REPORT_INTERVAL_MS * 1000) / SAMPLE_INTERVAL_US; // ~1,000 samples
-  uint32_t missedSlots = snapshot.missedSlots;
-  if (hasVibration && snapshot.sampleCount < expectedSamples) {
-    missedSlots += (expectedSamples - snapshot.sampleCount);
-  }
-  float acquisitionQuality = hasVibration
-      ? fminf(1.0f, (float)snapshot.sampleCount / (float)expectedSamples)
-      : 0.0f;
-
-  bool hasMotor = motorTempValid;
-  bool hasAmbient = ambientTempValid;
-  int wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -120;
-
-  // Local rule-based condition classification on ESP32
-  evaluateMotorCondition(maxRms, currentMotorTemp, currentAmbientTemp, hasVibration, hasMotor, hasAmbient);
-
+// ==============================================================================
+// BACKGROUND TELEMETRY REPORTING HANDLER (CORE 1)
+// ==============================================================================
+void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   recordSequenceNumber++;
   char recordIdBuf[48];
   snprintf(recordIdBuf, sizeof(recordIdBuf), "%s-%lu-%u",
-           DEVICE_ID, (unsigned long)time(nullptr), recordSequenceNumber);
+           DEVICE_ID, (unsigned long)snap.timestampSec, recordSequenceNumber);
   String recordId = String(recordIdBuf);
   String measuredAt = getRtcIsoTimestamp();
 
@@ -1189,33 +1385,28 @@ void reportTelemetry() {
   doc["device_id"] = DEVICE_ID;
   doc["record_id"] = recordId;
   doc["firmware_version"] = FIRMWARE_VERSION;
-  if (measuredAt.length() > 0) {
-    doc["measured_at"] = measuredAt;
-  } else {
-    doc["measured_at"] = nullptr;
-  }
+  if (measuredAt.length() > 0) doc["measured_at"] = measuredAt;
+  else doc["measured_at"] = nullptr;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    doc["wifi_rssi_dbm"] = wifiRssi;
-  } else {
-    doc["wifi_rssi_dbm"] = nullptr;
-  }
+  int wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -120;
+  if (WiFi.status() == WL_CONNECTED) doc["wifi_rssi_dbm"] = wifiRssi;
+  else doc["wifi_rssi_dbm"] = nullptr;
 
-  if (hasMotor) doc["motor_temp_c"] = currentMotorTemp;
+  if (snap.hasMotorTemp) doc["motor_temp_c"] = snap.motorTemp;
   else doc["motor_temp_c"] = nullptr;
 
-  if (hasAmbient) doc["ambient_temp_c"] = currentAmbientTemp;
+  if (snap.hasAmbientTemp) doc["ambient_temp_c"] = snap.ambientTemp;
   else doc["ambient_temp_c"] = nullptr;
 
-  if (hasVibration) {
-    doc["ax_g"] = meanX;
-    doc["ay_g"] = meanY;
-    doc["az_g"] = meanZ;
-    doc["rms_x_g"] = rmsX;
-    doc["rms_y_g"] = rmsY;
-    doc["rms_z_g"] = rmsZ;
-    doc["sample_count"] = snapshot.sampleCount;
-    doc["acquisition_quality"] = acquisitionQuality;
+  if (snap.hasVibration) {
+    doc["ax_g"] = snap.meanX;
+    doc["ay_g"] = snap.meanY;
+    doc["az_g"] = snap.meanZ;
+    doc["rms_x_g"] = snap.rmsX;
+    doc["rms_y_g"] = snap.rmsY;
+    doc["rms_z_g"] = snap.rmsZ;
+    doc["sample_count"] = snap.sampleCount;
+    doc["acquisition_quality"] = snap.acquisitionQuality;
   } else {
     doc["ax_g"] = nullptr;
     doc["ay_g"] = nullptr;
@@ -1226,12 +1417,12 @@ void reportTelemetry() {
     doc["sample_count"] = 0;
     doc["acquisition_quality"] = 0.0f;
   }
-  doc["i2c_errors"] = snapshot.i2cErrors;
-  doc["missed_sample_slots"] = missedSlots;
+  doc["i2c_errors"] = snap.i2cErrors;
+  doc["missed_sample_slots"] = snap.missedSlots;
 
-  // Condition classification transmitted from local ESP32 calculation
-  doc["condition_status"] = currentCondition;
-  doc["condition_reason"] = currentConditionReason;
+  // Local Condition Classification from ESP32
+  doc["condition_status"] = snap.conditionStatus;
+  doc["condition_reason"] = snap.conditionReason;
 
   // Storage Diagnostics
   doc["storage_medium"] = storageMedium;
@@ -1247,9 +1438,9 @@ void reportTelemetry() {
 #else
   JsonObject sensorStatus = doc.createNestedObject("sensor_status");
 #endif
-  sensorStatus["adxl345"] = hasVibration ? "ready" : (adxlError ? "error" : "not_detected");
-  sensorStatus["motor_temp"] = hasMotor ? "ready" : (motorProbeFound ? "error" : "not_detected");
-  sensorStatus["ambient_temp"] = hasAmbient ? "ready" : (ambientProbeFound ? "error" : "not_detected");
+  sensorStatus["adxl345"] = snap.hasVibration ? "ready" : (adxlError ? "error" : "not_detected");
+  sensorStatus["motor_temp"] = snap.hasMotorTemp ? "ready" : (motorProbeFound ? "error" : "not_detected");
+  sensorStatus["ambient_temp"] = snap.hasAmbientTemp ? "ready" : (ambientProbeFound ? "error" : "not_detected");
 
   String payload;
   serializeJson(doc, payload);
@@ -1264,117 +1455,99 @@ void reportTelemetry() {
       synced = true;
       consecutiveUploadFailures = 0;
       lastSuccessfulUploadMs = millis();
-
-      char motorStr[16], ambStr[16], diffStr[16], rmsStr[36];
-      if (hasMotor) snprintf(motorStr, sizeof(motorStr), "%.1f C", currentMotorTemp);
-      else snprintf(motorStr, sizeof(motorStr), "null (Missing)");
-
-      if (hasAmbient) snprintf(ambStr, sizeof(ambStr), "%.1f C", currentAmbientTemp);
-      else snprintf(ambStr, sizeof(ambStr), "null (Missing)");
-
-      if (hasMotor && hasAmbient) snprintf(diffStr, sizeof(diffStr), "%+.1f C", currentMotorTemp - currentAmbientTemp);
-      else snprintf(diffStr, sizeof(diffStr), "N/A");
-
-      if (hasVibration) snprintf(rmsStr, sizeof(rmsStr), "(%.3f, %.3f, %.3f)g", rmsX, rmsY, rmsZ);
-      else snprintf(rmsStr, sizeof(rmsStr), "null (Offline)");
-
-      Serial.println("--------------------------------------------------------------------------------");
-      Serial.printf("[HTTP %d] Telemetry Accepted | ID: %s | RTC: %s\n",
-                    httpCode, recordId.c_str(), measuredAt.c_str());
-      Serial.printf("  Condition: %s (%s)\n", currentCondition.c_str(), currentConditionReason.c_str());
-      Serial.printf("  Storage: %s (%.1f%% used | Pending: %u | Dropped: %u)\n",
-                    storageMedium.c_str(), storageUsedPct, unsyncedRecordsCount, droppedRecordsCount);
-      Serial.printf("  Motor (GPIO 10): %s | Ambient (GPIO 11): %s | Delta-T: %s\n",
-                    motorStr, ambStr, diffStr);
-      Serial.printf("  RMS Vibration: %s | DC Mean: (%.3f, %.3f, %.3f)g\n",
-                    rmsStr, meanX, meanY, meanZ);
-      Serial.println("--------------------------------------------------------------------------------");
     } else {
       consecutiveUploadFailures++;
-      Serial.printf("[HTTP %d ERROR] Telemetry upload failed: %s\n", httpCode, responseStr.c_str());
       saveRecordToQueue(recordId, payload);
     }
   } else {
-    // Offline or backlog present: save record to durable local storage
     saveRecordToQueue(recordId, payload);
   }
 
   // Always log to persistent CSV on MicroSD card
   appendTelemetryToCsv(
       recordId, measuredAt,
-      hasMotor, currentMotorTemp,
-      hasAmbient, currentAmbientTemp,
-      hasVibration, rmsX, rmsY, rmsZ,
-      snapshot.sampleCount, acquisitionQuality,
-      wifiRssi, currentCondition, storageMedium, storageUsedPct,
+      snap.hasMotorTemp, snap.motorTemp,
+      snap.hasAmbientTemp, snap.ambientTemp,
+      snap.hasVibration, snap.rmsX, snap.rmsY, snap.rmsZ,
+      snap.sampleCount, snap.acquisitionQuality,
+      wifiRssi, snap.conditionStatus, storageMedium, storageUsedPct,
       synced
   );
 }
 
+// ==============================================================================
+// SETUP (FAST LOCAL INITIALIZATION)
+// ==============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1500);
+  delay(100);
 
   Serial.println("\n========================================================");
-  Serial.println("  Industrial Motor Health Monitor — ESP32-S3 Firmware   ");
+  Serial.println("  Industrial Motor Health Monitor — Fast ESP32 Firmware ");
   Serial.println("  Device: " + String(DEVICE_ID) + " | FW: " + String(FIRMWARE_VERSION));
-  Serial.println("  Hardware: ESP32-S3 N16R8 (16MB Flash, 8MB PSRAM)");
-  Serial.println("  Wiring: ADXL345 & DS3231 (SDA:8, SCL:9)");
-  Serial.println("          Motor Temp (GPIO 10) | Ambient Temp (GPIO 11)");
-  Serial.println("          MicroSD SPI (SCK:12, MISO:13, MOSI:14, CS:15)");
-  Serial.println("          Test LEDs (GPIOs: 4, 5, 6, 7, 16)");
-  Serial.println("          Status LEDs (Red: 17, Green: 18)");
+  Serial.println("  Hardware: ESP32-S3 N16R8 Dual-Core 240MHz");
   Serial.println("========================================================");
 
-  // 1. Authoritative GPIO Pin Configuration (Test LEDs & Status LEDs)
+  // 1. Authoritative Hardware Pin Configuration
   configureHardwarePins();
 
-  // 2. Initialise I2C bus for ADXL345 and DS3231 RTC
+  // 2. Initialise Mutexes and Realtime Telemetry Queue
+  i2cMutex = xSemaphoreCreateMutex();
+  telemetrySnapshotQueue = xQueueCreate(4, sizeof(TelemetrySnapshot));
+
+  // 3. Initialise I2C Bus for ADXL345 & DS3231 RTC
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(I2C_FREQUENCY_HZ);
   initialiseADXL345(true);
   initialiseDS3231(true);
 
-  // 3. Initialise Storage Hierarchy (MicroSD + LittleFS Fallback)
+  // 4. Initialise Storage Hierarchy
   initialiseSDCard(true);
 
-  // 4. Initialise OneWire for Dual DS18B20 Probes
+  // 5. Initialise OneWire Temperature Probes
   discoverTemperatureProbes(true);
 
-  // 5. Create FreeRTOS Mutex for vibration data
-  vibrationMutex = xSemaphoreCreateMutex();
-  if (vibrationMutex == nullptr) {
-    Serial.println("[CRITICAL] Failed to allocate FreeRTOS mutex!");
-  }
-
-  // 6. Start Core 0 vibration task (200 Hz continuous acquisition)
+  // 6. Launch Real-Time Hardware Task on Core 0 (Priority 5)
+  // Real-time vibration sampling & condition evaluation starts IMMEDIATELY!
   xTaskCreatePinnedToCore(
-      vibrationSamplingTask,
-      "VibeSampler",
+      realtimeVibrationTask,
+      "RT_VibeEngine",
       4096,
       nullptr,
-      2,
-      nullptr,
-      0
+      5, // High priority
+      &realtimeVibrationTaskHandle,
+      0  // Dedicated to Core 0 (isolated from Wi-Fi stack)
   );
 
-  // 7. Connect Wi-Fi
+  // 7. Start Asynchronous Wi-Fi Connection in Background (Non-Blocking)
   startWiFiConnection();
 
-  lastReportMs = millis();
+  lastWiFiAttemptMs = millis();
   lastRediscoveryMs = millis();
   lastCommandPollMs = millis();
-  Serial.println("[SYSTEM] Setup complete. Entering fault-tolerant calculation loop.\n");
+  lastPerfLogMs = millis();
+
+  Serial.println("[SYSTEM] Real-time monitoring active. Entering background loop.\n");
 }
 
+// ==============================================================================
+// MAIN LOOP (CORE 1 BACKGROUND COMMUNICATIONS & STORAGE)
+// ==============================================================================
 void loop() {
-  maintainWiFi();
-  updateTemperatures();
+  maintainWiFiAsync();
+  updateTemperaturesAsync();
   checkSensorRecovery();
   processBacklogQueue();
-  updateLedIndicators();
 
   uint32_t now = millis();
+
+  // Check for incoming Telemetry Snapshots from Core 0 Realtime Task
+  if (telemetrySnapshotQueue) {
+    TelemetrySnapshot snap;
+    if (xQueueReceive(telemetrySnapshotQueue, &snap, 0) == pdTRUE) {
+      handleTelemetrySnapshot(snap);
+    }
+  }
 
   // Periodic Two-Way Command Polling from Web Dashboard (every 5 seconds)
   if (now - lastCommandPollMs >= 5000) {
@@ -1382,11 +1555,22 @@ void loop() {
     pollDeviceCommands();
   }
 
-  // Periodic Telemetry Window Calculation & Transmission
-  if (now - lastReportMs >= REPORT_INTERVAL_MS) {
-    lastReportMs = now;
-    reportTelemetry();
+  // Periodic Low-Overhead Performance Metrics Log (every 5 seconds)
+  if (now - lastPerfLogMs >= 5000) {
+    lastPerfLogMs = now;
+    Serial.println("--------------------------------------------------------------------------------");
+    Serial.printf("[PERF-STATS] Sample Interval: %u us (Min: %u | Max: %u) | Exec: %u us\n",
+                  perfMetrics.sampleIntervalUs, perfMetrics.minSampleIntervalUs,
+                  perfMetrics.maxSampleIntervalUs, perfMetrics.sampleExecDurationUs);
+    Serial.printf("[PERF-STATS] Fast RMS Eval: %u us | Decision->LED Latency: %u us\n",
+                  perfMetrics.fastRmsCalcDurationUs, perfMetrics.conditionToLedLatencyUs);
+    Serial.printf("[PERF-STATS] SD Write: %u ms | HTTPS Upload: %u ms | Overflow: %u | Core0 Stack Free: %u B\n",
+                  perfMetrics.lastSdWriteDurationMs, perfMetrics.lastUploadDurationMs,
+                  perfMetrics.queueOverflowCount, perfMetrics.realtimeTaskStackWatermark);
+    Serial.printf("[PERF-STATS] Condition: %s (%s)\n",
+                  currentCondition.c_str(), currentConditionReason.c_str());
+    Serial.println("--------------------------------------------------------------------------------");
   }
 
-  delay(10);
+  delay(5);
 }

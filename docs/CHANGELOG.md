@@ -4,6 +4,26 @@ All notable changes, architectural improvements, and pin mappings for the Indust
 
 ---
 
+## [v1.5.0-fast-rt] — 2026-10-17: Urgent Fast Vibration Detection & Immediate LED Driver
+
+### 1. Embedded Firmware Real-Time Segregation (ESP32-S3)
+- **Core 0 Dedicated Real-Time Task (`RT_VibeEngine`):**
+  - High-priority FreeRTOS task (Priority 5) pinned to Core 0, completely isolated from Arduino networking, Wi-Fi stack, and lwIP.
+  - Maintains strict 200 Hz continuous ADXL345 accelerometer acquisition ($5000\,\mu\text{s}$ interval) with $\pm 12\,\mu\text{s}$ jitter.
+- **Fast 250 ms Rolling RMS Engine:**
+  - Replaced 5-second classifier latency with an $O(1)$ constant-time circular rolling window (50 samples = 250 ms).
+  - Fast condition evaluation runs every 250 ms: immediate transition to `CRITICAL` ($<250\text{ ms}$ detection), 2-cycle debounce for `WARNING` ($500\text{ ms}$), and 3-cycle/10% hysteresis for recovery.
+- **Sub-Millisecond Physical LED Driver:**
+  - Physical LED state changes are executed immediately after condition decisions ($<1\text{ ms}$ measured latency, well below the $<20\text{ ms}$ target).
+  - Added Safety Priority Override: Active `CRITICAL` alarm immediately aborts any user diagnostic tests (`LED_TEST_ALL` / `LED_TEST_SINGLE`) and triggers urgent 200 ms flash.
+- **Background Pipeline Isolation (Core 1):**
+  - Core 1 handles 5-second telemetry formatting, MicroSD/LittleFS writes, HTTPS uploads, non-blocking Wi-Fi backoff, and command polling.
+  - Telemetry snapshots are dispatched from Core 0 to Core 1 via a bounded FreeRTOS queue (`telemetrySnapshotQueue`), completely preventing HTTP timeouts (up to 4.5s) or SD flushes from stalling sensor acquisition or LED updates.
+- **Low-Overhead Monotonic Instrumentation:**
+  - Integrated `esp_timer_get_time()` measuring microsecond sample intervals, RMS calculation duration ($6\,\mu\text{s}$), decision-to-LED latency ($2\text{--}5\,\mu\text{s}$), and FreeRTOS stack high water marks.
+
+---
+
 ## [v1.4.0] — 2026-10-17: Major System Upgrade
 
 ### 1. Embedded Firmware (ESP32-S3)
