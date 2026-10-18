@@ -222,3 +222,10 @@ export const TelemetryPayloadSchema = z.object({
 
 export type ValidatedTelemetryPayload = z.infer<typeof TelemetryPayloadSchema>;
 
+export const TelemetryBatchPayloadSchema = z.union([
+  TelemetryPayloadSchema,
+  z.array(TelemetryPayloadSchema).min(1, 'Batch must contain at least 1 record').max(50, 'Batch size must not exceed 50 records'),
+]);
+
+export type ValidatedTelemetryBatchPayload = z.infer<typeof TelemetryBatchPayloadSchema>;
+

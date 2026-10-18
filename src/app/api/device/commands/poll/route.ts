@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { verifyDeviceAuth } from '@/lib/security/auth';
 import { getPendingDeviceCommands } from '@/lib/supabase/db';
 
-export async function POST(request: NextRequest) {
+async function handlePoll(request: NextRequest) {
   // 1. Authenticate device request
   const auth = verifyDeviceAuth(request.headers);
   if (!auth.authorized) {
@@ -43,4 +43,12 @@ export async function POST(request: NextRequest) {
     const errorMsg = err instanceof Error ? err.message : 'Failed to poll commands';
     return NextResponse.json({ error: errorMsg }, { status: 500 });
   }
+}
+
+export async function POST(request: NextRequest) {
+  return handlePoll(request);
+}
+
+export async function GET(request: NextRequest) {
+  return handlePoll(request);
 }

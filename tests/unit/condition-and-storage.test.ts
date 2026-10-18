@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { TelemetryPayloadSchema } from '@/lib/validation/telemetry';
+import { TelemetryPayloadSchema, TelemetryBatchPayloadSchema } from '@/lib/validation/telemetry';
+import { getStorageBudgetStatus } from '@/lib/supabase/db';
 
 describe('Condition Classification and Storage Hierarchy Validation', () => {
   const basePayload = {
@@ -73,5 +74,28 @@ describe('Condition Classification and Storage Hierarchy Validation', () => {
       storage_used_pct: -5,
     });
     expect(res.success).toBe(false);
+  });
+
+  it('validates batch telemetry payloads for opportunistic offline sync', () => {
+    const batch = [
+      { ...basePayload, record_id: 'rec-001', motor_temp_c: 44.5 },
+      { ...basePayload, record_id: 'rec-002', motor_temp_c: 45.1 },
+      { ...basePayload, record_id: 'rec-003', motor_temp_c: 45.8 },
+    ];
+    const res = TelemetryBatchPayloadSchema.safeParse(batch);
+    expect(res.success).toBe(true);
+    expect(Array.isArray(res.data)).toBe(true);
+    expect((res.data as unknown[]).length).toBe(3);
+  });
+
+  it('validates 500 MB cloud quota partitioning (400 MB general / 100 MB error logs)', async () => {
+    const budget = await getStorageBudgetStatus();
+    expect(budget.cloud.general_data_limit_mb).toBe(400);
+    expect(budget.cloud.error_data_limit_mb).toBe(100);
+    expect(budget.cloud.total_limit_mb).toBe(500);
+    expect(budget.edge.total_ceiling_pct).toBe(90);
+    expect(budget.edge.telemetry_backlog_budget_pct).toBe(85);
+    expect(budget.edge.error_diagnostics_budget_pct).toBe(15);
+    expect(budget.edge.fifo_step_deletion_active).toBe(true);
   });
 });

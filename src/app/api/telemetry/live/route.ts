@@ -1,5 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getLiveTelemetry, getDevice, getDeviceConfig, calculateDeviceConnectionStatus, getTotalTelemetryCount } from '@/lib/supabase/db';
+import {
+  getLiveTelemetry,
+  getDevice,
+  getDeviceConfig,
+  calculateDeviceConnectionStatus,
+  getTotalTelemetryCount,
+  getStorageBudgetStatus,
+} from '@/lib/supabase/db';
 
 export async function GET(request: NextRequest) {
   try {
@@ -7,11 +14,12 @@ export async function GET(request: NextRequest) {
     const deviceId = searchParams.get('device_id') || 'motor-monitor-001';
     const windowSeconds = parseInt(searchParams.get('window') || '300', 10); // default 5 min
 
-    const [device, records, config, totalSupabaseRecords] = await Promise.all([
+    const [device, records, config, totalSupabaseRecords, storageBudget] = await Promise.all([
       getDevice(deviceId),
       getLiveTelemetry(deviceId, windowSeconds),
       getDeviceConfig(deviceId),
       getTotalTelemetryCount(deviceId),
+      getStorageBudgetStatus(),
     ]);
 
     const latest = records.length > 0 ? records[records.length - 1] : null;
@@ -95,6 +103,7 @@ export async function GET(request: NextRequest) {
       flash_free_bytes: (flashTotalBytes !== null && flashUsedBytes !== null && flashTotalBytes !== undefined && flashUsedBytes !== undefined)
         ? Math.max(0, flashTotalBytes - flashUsedBytes)
         : null,
+      budget: storageBudget,
     };
 
     // Validate RSSI: Standard 2.4GHz Wi-Fi RSSI is between -100 and -15 dBm.

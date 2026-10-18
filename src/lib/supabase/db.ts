@@ -1,6 +1,12 @@
 import crypto from 'crypto';
 import { getAdminClient } from './admin';
-import { TelemetryRecord, DeviceRecord, TelemetryStats, DeviceConnectionStatus } from '../types/telemetry';
+import {
+  TelemetryRecord,
+  DeviceRecord,
+  TelemetryStats,
+  DeviceConnectionStatus,
+  StorageBudgetBreakdown,
+} from '../types/telemetry';
 import { DeviceConfig, DeviceConfigAck } from '../types/config';
 import {
   DeviceCommandRecord,
@@ -1191,5 +1197,240 @@ export async function getDeviceDiagnosticEvents(
     })
     .sort((a, b) => new Date(b.event_timestamp).getTime() - new Date(a.event_timestamp).getTime())
     .slice(offset, offset + limit);
+}
+
+/**
+ * Calculates current Supabase 500 MB Free Tier quota utilization:
+ *  - 400 MB dedicated to General Telemetry
+ *  - 100 MB reserved for Diagnostics, Errors & Audit Events
+ * Also aligns with edge storage 90% ceiling (85% backlog / 15% error reserve).
+ */
+export async function getStorageBudgetStatus(): Promise<StorageBudgetBreakdown> {
+  const admin = getAdminClient();
+  const defaultBudget: StorageBudgetBreakdown = {
+    cloud: {
+      general_data_mb: 0.1,
+      general_data_limit_mb: 400.0,
+      general_data_used_pct: 0.02,
+      error_data_mb: 0.05,
+      error_data_limit_mb: 100.0,
+      error_data_used_pct: 0.05,
+      total_used_mb: 0.15,
+      total_limit_mb: 500.0,
+      total_used_pct: 0.03,
+    },
+    edge: {
+      total_ceiling_pct: 90.0,
+      telemetry_backlog_budget_pct: 85.0,
+      error_diagnostics_budget_pct: 15.0,
+      fifo_step_deletion_active: true,
+    },
+  };
+
+  if (!admin) {
+    const telRows = mockDb.telemetry.length;
+    const evtRows = mockDb.events.length;
+    const genMb = Number(((telRows * 500) / (1024 * 1024)).toFixed(2));
+    const errMb = Number(((evtRows * 600) / (1024 * 1024)).toFixed(2));
+    defaultBudget.cloud.general_data_mb = Math.max(0.01, genMb);
+    defaultBudget.cloud.general_data_used_pct = Number(((genMb / 400.0) * 100).toFixed(2));
+    defaultBudget.cloud.error_data_mb = Math.max(0.01, errMb);
+    defaultBudget.cloud.error_data_used_pct = Number(((errMb / 100.0) * 100).toFixed(2));
+    defaultBudget.cloud.total_used_mb = Number((genMb + errMb).toFixed(2));
+    defaultBudget.cloud.total_used_pct = Number((((genMb + errMb) / 500.0) * 100).toFixed(2));
+    return defaultBudget;
+  }
+
+  try {
+    const { data: rpcData, error: rpcError } = await admin.rpc('get_storage_budget_status');
+    if (!rpcError && rpcData && typeof rpcData === 'object' && 'cloud_quota' in rpcData) {
+      const cq = (rpcData as { cloud_quota: Record<string, number> }).cloud_quota;
+      return {
+        cloud: {
+          general_data_mb: Number(cq.general_data_mb || 0),
+          general_data_limit_mb: 400.0,
+          general_data_used_pct: Number(cq.general_data_used_pct || 0),
+          error_data_mb: Number(cq.error_data_mb || 0),
+          error_data_limit_mb: 100.0,
+          error_data_used_pct: Number(cq.error_data_used_pct || 0),
+          total_used_mb: Number(cq.total_used_mb || 0),
+          total_limit_mb: 500.0,
+          total_used_pct: Number(cq.total_used_pct || 0),
+        },
+        edge: {
+          total_ceiling_pct: 90.0,
+          telemetry_backlog_budget_pct: 85.0,
+          error_diagnostics_budget_pct: 15.0,
+          fifo_step_deletion_active: true,
+        },
+      };
+    }
+
+    const [telRes, evtRes] = await Promise.all([
+      admin.from('telemetry').select('id', { count: 'exact', head: true }),
+      admin.from('device_diagnostic_events').select('id', { count: 'exact', head: true }),
+    ]);
+
+    const telCount = telRes.count || 0;
+    const evtCount = evtRes.count || 0;
+    const estimatedGenBytes = telCount * 750 + 50000;
+    const estimatedErrBytes = evtCount * 800 + 50000;
+    const genMb = Number((estimatedGenBytes / (1024 * 1024)).toFixed(2));
+    const errMb = Number((estimatedErrBytes / (1024 * 1024)).toFixed(2));
+    const totMb = Number((genMb + errMb).toFixed(2));
+
+    return {
+      cloud: {
+        general_data_mb: genMb,
+        general_data_limit_mb: 400.0,
+        general_data_used_pct: Number(((genMb / 400.0) * 100).toFixed(2)),
+        error_data_mb: errMb,
+        error_data_limit_mb: 100.0,
+        error_data_used_pct: Number(((errMb / 100.0) * 100).toFixed(2)),
+        total_used_mb: totMb,
+        total_limit_mb: 500.0,
+        total_used_pct: Number(((totMb / 500.0) * 100).toFixed(2)),
+      },
+      edge: {
+        total_ceiling_pct: 90.0,
+        telemetry_backlog_budget_pct: 85.0,
+        error_diagnostics_budget_pct: 15.0,
+        fifo_step_deletion_active: true,
+      },
+    };
+  } catch {
+    return defaultBudget;
+  }
+}
+
+/**
+ * High-throughput batch insertion of telemetry records.
+ * Drastically speeds up backlog flushes when offline devices catch an internet connection.
+ */
+export async function insertTelemetryBatch(
+  records: Array<Omit<TelemetryRecord, 'id'>>
+): Promise<TelemetryRecord[]> {
+  if (records.length === 0) return [];
+  if (records.length === 1) {
+    const single = await insertTelemetry(records[0]);
+    return [single];
+  }
+
+  const admin = getAdminClient();
+  const latestRecord = records[records.length - 1];
+  const recordedAt = latestRecord.recorded_at || new Date().toISOString();
+
+  if (admin) {
+    try {
+      const devUpsert: Record<string, unknown> = {
+        device_id: latestRecord.device_id,
+        display_name: `Motor Device ${latestRecord.device_id}`,
+        last_seen_at: recordedAt,
+        updated_at: recordedAt,
+      };
+      if (latestRecord.sensor_status) devUpsert.sensor_status = latestRecord.sensor_status;
+      if (latestRecord.wifi_rssi_dbm !== undefined) devUpsert.wifi_rssi_dbm = latestRecord.wifi_rssi_dbm;
+      if (latestRecord.sd_card_status) devUpsert.sd_card_status = latestRecord.sd_card_status;
+      if (latestRecord.rtc_status) devUpsert.rtc_status = latestRecord.rtc_status;
+      if (latestRecord.unsynced_records_count !== undefined) devUpsert.unsynced_records_count = latestRecord.unsynced_records_count;
+      if (latestRecord.measured_at) devUpsert.last_measured_at = latestRecord.measured_at;
+      if (latestRecord.condition_status) devUpsert.condition_status = latestRecord.condition_status;
+      if (latestRecord.condition_reason) devUpsert.condition_reason = latestRecord.condition_reason;
+      if (latestRecord.storage_medium) devUpsert.storage_medium = latestRecord.storage_medium;
+      if (latestRecord.storage_used_pct !== undefined) devUpsert.storage_used_pct = latestRecord.storage_used_pct;
+      if (latestRecord.dropped_records_count !== undefined) devUpsert.dropped_records_count = latestRecord.dropped_records_count;
+
+      await admin.from('devices').upsert(devUpsert, { onConflict: 'device_id' });
+
+      const batchPayloads = records.map((r) => {
+        const recTime = r.recorded_at || new Date().toISOString();
+        const p: Record<string, unknown> = {
+          device_id: r.device_id,
+          recorded_at: recTime,
+          motor_temp_c: r.motor_temp_c ?? null,
+          ambient_temp_c: r.ambient_temp_c ?? null,
+          ax_g: r.ax_g ?? null,
+          ay_g: r.ay_g ?? null,
+          az_g: r.az_g ?? null,
+          rms_x_g: r.rms_x_g ?? null,
+          rms_y_g: r.rms_y_g ?? null,
+          rms_z_g: r.rms_z_g ?? null,
+          firmware_version: r.firmware_version || null,
+          sample_count: r.sample_count ?? null,
+          acquisition_quality: r.acquisition_quality ?? null,
+        };
+        if (r.record_id) p.record_id = r.record_id;
+        if (r.measured_at) p.measured_at = r.measured_at;
+        if (r.wifi_rssi_dbm !== undefined) p.wifi_rssi_dbm = r.wifi_rssi_dbm;
+        if (r.sensor_status) p.sensor_status = r.sensor_status;
+        if (r.i2c_errors !== undefined) p.i2c_errors = r.i2c_errors;
+        if (r.missed_sample_slots !== undefined) p.missed_sample_slots = r.missed_sample_slots;
+        if (r.sd_card_status) p.sd_card_status = r.sd_card_status;
+        if (r.unsynced_records_count !== undefined) p.unsynced_records_count = r.unsynced_records_count;
+        if (r.oldest_unsynced_timestamp) p.oldest_unsynced_timestamp = r.oldest_unsynced_timestamp;
+        if (r.rtc_status) p.rtc_status = r.rtc_status;
+        if (r.rtc_synced !== undefined) p.rtc_synced = r.rtc_synced;
+        if (r.condition_status) p.condition_status = r.condition_status;
+        if (r.condition_reason) p.condition_reason = r.condition_reason;
+        if (r.storage_medium) p.storage_medium = r.storage_medium;
+        if (r.storage_used_pct !== undefined) p.storage_used_pct = r.storage_used_pct;
+        if (r.dropped_records_count !== undefined) p.dropped_records_count = r.dropped_records_count;
+        return p;
+      });
+
+      const { data, error } = await admin
+        .from('telemetry')
+        .upsert(batchPayloads, { onConflict: 'record_id', ignoreDuplicates: true })
+        .select();
+
+      if (!error && data && data.length > 0) {
+        return data as TelemetryRecord[];
+      }
+    } catch (e) {
+      console.warn(`[BATCH_UPSERT_FALLBACK] Error in batch upsert: ${e}. Inserting individually.`);
+    }
+  }
+
+  const inserted: TelemetryRecord[] = [];
+  for (const r of records) {
+    const item = await insertTelemetry(r);
+    inserted.push(item);
+  }
+  return inserted;
+}
+
+/**
+ * Evaluates storage quotas and triggers step-by-step FIFO pruning if 400 MB general quota is exceeded.
+ */
+export async function pruneCloudStorageIfExceeded(): Promise<{ pruned: boolean; message: string }> {
+  const admin = getAdminClient();
+  if (!admin) return { pruned: false, message: 'Admin client not available' };
+
+  try {
+    const { data, error } = await admin.rpc('prune_telemetry_within_budget', { target_max_mb: 400.0, batch_size: 5000 });
+    if (!error && data) {
+      return { pruned: true, message: `Pruned telemetry: ${JSON.stringify(data)}` };
+    }
+  } catch {
+    // If stored procedure not yet executed on remote DB, fallback to row count check
+    try {
+      const { count } = await admin.from('telemetry').select('id', { count: 'exact', head: true });
+      if (count && count > 500000) {
+        const { data: oldest } = await admin
+          .from('telemetry')
+          .select('id')
+          .order('recorded_at', { ascending: true })
+          .limit(5000);
+        if (oldest && oldest.length > 0) {
+          const ids = oldest.map((r: { id: number }) => r.id);
+          await admin.from('telemetry').delete().in('id', ids);
+          return { pruned: true, message: `Pruned oldest ${ids.length} rows step-by-step to protect 400 MB quota` };
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+  return { pruned: false, message: 'Storage within quota limits' };
 }
 

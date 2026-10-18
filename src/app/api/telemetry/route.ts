@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { TelemetryPayloadSchema } from '@/lib/validation/telemetry';
+import { TelemetryPayloadSchema, TelemetryBatchPayloadSchema, ValidatedTelemetryPayload } from '@/lib/validation/telemetry';
 import { verifyDeviceAuth, redactSecrets } from '@/lib/security/auth';
 import { checkRateLimit } from '@/lib/security/rate-limiter';
-import { insertTelemetry } from '@/lib/supabase/db';
+import { insertTelemetry, insertTelemetryBatch, pruneCloudStorageIfExceeded } from '@/lib/supabase/db';
 
 export async function POST(request: NextRequest) {
   try {
@@ -16,11 +16,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2. Request body size check (max 16 KB for IoT telemetry)
+    // 2. Request body size check (max 128 KB to support opportunistic batch flushes)
     const contentLength = request.headers.get('content-length');
-    if (contentLength && parseInt(contentLength, 10) > 16384) {
+    if (contentLength && parseInt(contentLength, 10) > 131072) {
       return NextResponse.json(
-        { error: 'Payload Too Large', message: 'Payload exceeds 16KB limit' },
+        { error: 'Payload Too Large', message: 'Payload exceeds 128KB limit' },
         { status: 413 }
       );
     }
@@ -36,23 +36,28 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 4. Schema validation
-    const parseResult = TelemetryPayloadSchema.safeParse(rawBody);
+    // 4. Schema validation (supports single record or batch array)
+    const isArray = Array.isArray(rawBody);
+    const parseResult = TelemetryBatchPayloadSchema.safeParse(rawBody);
     if (!parseResult.success) {
       const issueMessages = parseResult.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`);
-      console.warn(`[TELEMETRY_VALIDATION_ERROR] Device: ${(rawBody as Record<string, unknown>)?.device_id}`, issueMessages, JSON.stringify(rawBody));
+      console.warn(`[TELEMETRY_VALIDATION_ERROR]`, issueMessages);
       return NextResponse.json(
         { error: 'Validation Error', details: issueMessages },
         { status: 400 }
       );
     }
 
-    const payload = parseResult.data;
+    const payloads: ValidatedTelemetryPayload[] = isArray
+      ? (parseResult.data as ValidatedTelemetryPayload[])
+      : [parseResult.data as ValidatedTelemetryPayload];
 
-    // 5. Rate limiting per device
-    const rateCheck = checkRateLimit(payload.device_id, {
+    const primaryDeviceId = payloads[0].device_id;
+
+    // 5. Rate limiting per device (accommodates batches)
+    const rateCheck = checkRateLimit(primaryDeviceId, {
       windowMs: 10000,
-      maxRequests: 30, // 3 requests/sec max
+      maxRequests: 60, // accommodate batch bursts
     });
 
     if (!rateCheck.allowed) {
@@ -66,50 +71,60 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 6. Generate trusted server-side timestamp
+    // 6. Generate server-side timestamps
     const authoritativeRecordedAt = new Date().toISOString();
 
-    // 7. Persist to database
-    const savedRecord = await insertTelemetry({
-      ...payload,
-      sensor_status: payload.sensor_status || undefined,
-      recorded_at: authoritativeRecordedAt,
-    });
+    // 7. Persist to database (batch or single)
+    const recordsToInsert = payloads.map((p, idx) => ({
+      ...p,
+      sensor_status: p.sensor_status || undefined,
+      recorded_at: isArray
+        ? new Date(Date.now() - (payloads.length - 1 - idx) * 1000).toISOString()
+        : authoritativeRecordedAt,
+    }));
+
+    const savedRecords = await insertTelemetryBatch(recordsToInsert);
+    const latestSaved = savedRecords[savedRecords.length - 1];
+
+    // Asynchronously trigger 400 MB storage quota retention check in background
+    pruneCloudStorageIfExceeded().catch(() => {});
 
     // Redacted structured logging for telemetry ingestion
     console.log(
       JSON.stringify({
         event: 'telemetry_ingested',
-        device_id: payload.device_id,
-        record_id: payload.record_id || savedRecord.id,
-        recorded_at: authoritativeRecordedAt,
-        measured_at: payload.measured_at ?? null,
-        motor_temp: payload.motor_temp_c ?? null,
-        ambient_temp: payload.ambient_temp_c ?? null,
-        rms_z: payload.rms_z_g ?? null,
-        sensor_status: payload.sensor_status ?? null,
-        wifi_rssi: payload.wifi_rssi_dbm ?? null,
-        sd_card: payload.sd_card_status ?? null,
-        rtc: payload.rtc_status ?? null,
-        unsynced_count: payload.unsynced_records_count ?? 0,
+        batch_size: payloads.length,
+        device_id: primaryDeviceId,
+        record_id: latestSaved.record_id || latestSaved.id,
+        recorded_at: latestSaved.recorded_at,
+        measured_at: latestSaved.measured_at ?? null,
+        motor_temp: latestSaved.motor_temp_c ?? null,
+        ambient_temp: latestSaved.ambient_temp_c ?? null,
+        rms_z: latestSaved.rms_z_g ?? null,
+        sensor_status: latestSaved.sensor_status ?? null,
+        wifi_rssi: latestSaved.wifi_rssi_dbm ?? null,
+        sd_card: latestSaved.sd_card_status ?? null,
+        rtc: latestSaved.rtc_status ?? null,
+        unsynced_count: latestSaved.unsynced_records_count ?? 0,
       })
     );
 
     return NextResponse.json(
       {
         success: true,
-        device_id: savedRecord.device_id,
-        recorded_at: savedRecord.recorded_at,
-        measured_at: savedRecord.measured_at ?? null,
-        record_id: savedRecord.record_id ?? null,
-        id: savedRecord.id,
-        sensor_status: savedRecord.sensor_status ?? null,
-        sd_card_status: savedRecord.sd_card_status ?? null,
-        rtc_status: savedRecord.rtc_status ?? null,
-        condition_status: savedRecord.condition_status ?? null,
-        condition_reason: savedRecord.condition_reason ?? null,
-        storage_medium: savedRecord.storage_medium ?? null,
-        storage_used_pct: savedRecord.storage_used_pct ?? null,
+        batch_count: savedRecords.length,
+        device_id: latestSaved.device_id,
+        recorded_at: latestSaved.recorded_at,
+        measured_at: latestSaved.measured_at ?? null,
+        record_id: latestSaved.record_id ?? null,
+        id: latestSaved.id,
+        sensor_status: latestSaved.sensor_status ?? null,
+        sd_card_status: latestSaved.sd_card_status ?? null,
+        rtc_status: latestSaved.rtc_status ?? null,
+        condition_status: latestSaved.condition_status ?? null,
+        condition_reason: latestSaved.condition_reason ?? null,
+        storage_medium: latestSaved.storage_medium ?? null,
+        storage_used_pct: latestSaved.storage_used_pct ?? null,
       },
       {
         status: 201,

@@ -459,6 +459,32 @@ export default function DashboardPage() {
           lastSeenTimestamp={lastSuccessfulTelemetry}
         />
 
+        {/* Weak Wi-Fi Link / Intermittent Connectivity Banner */}
+        {latest?.wifi_rssi_dbm !== null && latest?.wifi_rssi_dbm !== undefined && latest.wifi_rssi_dbm <= -75 && isOnline && (
+          <div className="bg-amber-950/40 border border-amber-800/60 rounded-lg p-3 text-xs flex items-center justify-between text-amber-200">
+            <div className="flex items-center gap-2">
+              <Wifi className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                <strong>Weak Wi-Fi Link ({latest.wifi_rssi_dbm} dBm):</strong> Device operates primarily offline with local store-first buffering. Backlogged records automatically flush in batches whenever a stable link is acquired.
+              </span>
+            </div>
+            <Badge variant="warning">Opportunistic Sync</Badge>
+          </div>
+        )}
+
+        {/* Storage Ceiling FIFO Step-by-Step Deletion Banner */}
+        {droppedRecordsCount > 0 && (
+          <div className="bg-rose-950/40 border border-rose-800/60 rounded-lg p-3 text-xs flex items-center justify-between text-rose-200">
+            <div className="flex items-center gap-2">
+              <HardDrive className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>
+                <strong>Storage Ceiling Active (90% limit):</strong> {droppedRecordsCount} oldest records safely pruned step-by-step via FIFO policy to protect filesystem integrity.
+              </span>
+            </div>
+            <Badge variant="warning">FIFO Auto-Pruned</Badge>
+          </div>
+        )}
+
         {dashboardMode === 'simple' ? (
           <SimpleMotorView
             conditionStatus={conditionStatus}
@@ -1007,7 +1033,7 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                   <HardDrive className="w-3.5 h-3.5 text-amber-400" />
-                  MicroSD Card (Master)
+                  MicroSD Card (Edge Partition)
                 </span>
                 <Badge variant={sdCardState === 'ready' ? 'online' : 'offline'} dot>
                   {sdCardState === 'ready' ? 'Ready' : 'Missing'}
@@ -1019,7 +1045,7 @@ export default function DashboardPage() {
                     {formatBytes(storageDiagnostics?.sd_total_bytes)}
                   </span>
                   <span className="text-xs font-mono text-slate-400">
-                    {storageUsedPct.toFixed(2)}% used
+                    {storageUsedPct.toFixed(2)}% of 90%
                   </span>
                 </div>
                 <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
@@ -1027,6 +1053,10 @@ export default function DashboardPage() {
                     className="bg-amber-400 h-full rounded-full transition-all duration-500"
                     style={{ width: `${Math.min(100, Math.max(storageUsedPct, 2))}%` }}
                   />
+                </div>
+                <div className="flex justify-between text-[10px] text-slate-500 font-mono pt-0.5">
+                  <span>85% Telemetry Queue</span>
+                  <span>15% Error Logs</span>
                 </div>
               </div>
               <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
@@ -1040,7 +1070,7 @@ export default function DashboardPage() {
                 </div>
                 <div className="text-[10px] text-amber-400/90 pt-1 flex items-center gap-1">
                   <CheckCircle2 className="w-3 h-3 shrink-0" />
-                  <span>Physical Eject Safe (/telemetry.csv)</span>
+                  <span>FIFO Step-by-Step Pruning Active</span>
                 </div>
               </div>
             </Card>
@@ -1078,6 +1108,10 @@ export default function DashboardPage() {
                     }}
                   />
                 </div>
+                <div className="flex justify-between text-[10px] text-slate-500 font-mono pt-0.5">
+                  <span>85% Backlog</span>
+                  <span>15% Errors</span>
+                </div>
               </div>
               <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
                 <div className="flex justify-between">
@@ -1089,7 +1123,7 @@ export default function DashboardPage() {
                   <span className="text-cyan-400 font-semibold">{formatBytes(storageDiagnostics?.flash_free_bytes)}</span>
                 </div>
                 <div className="text-[10px] text-slate-500 pt-1">
-                  Strict 90% flash guard protects system SPI boot sector
+                  FIFO auto-prune protects 10% SPI boot sector reserve
                 </div>
               </div>
             </Card>
@@ -1099,10 +1133,10 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                   <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                  Pending Upload Queue
+                  Offline Backlog Queue
                 </span>
                 <Badge variant={unsyncedCount > 0 ? 'warning' : 'online'} dot>
-                  {unsyncedCount > 0 ? `${unsyncedCount} Backlog` : 'All Synced'}
+                  {unsyncedCount > 0 ? `${unsyncedCount} Queued` : 'All Synced'}
                 </Badge>
               </div>
               <div className="space-y-1 mb-3">
@@ -1117,63 +1151,83 @@ export default function DashboardPage() {
                 <div className="text-xs text-slate-400">
                   {unsyncedCount === 0
                     ? 'Durability queue clean; no pending uploads.'
-                    : `Oldest: ${storageDiagnostics?.oldest_unsynced_timestamp ? new Date(storageDiagnostics.oldest_unsynced_timestamp).toLocaleTimeString() : 'In transit'}`}
+                    : `Opportunistic batch sync armed (oldest: ${storageDiagnostics?.oldest_unsynced_timestamp ? new Date(storageDiagnostics.oldest_unsynced_timestamp).toLocaleTimeString() : 'In transit'})`}
                 </div>
               </div>
               <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
                 <div className="flex justify-between">
-                  <span>Drain Thread:</span>
-                  <span className="text-slate-200">Core 1 Async Background</span>
+                  <span>Drain Mode:</span>
+                  <span className="text-slate-200">Opportunistic Batch Sync</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Dropped Packets:</span>
+                  <span>Ceiling Pruned:</span>
                   <span className={droppedRecordsCount > 0 ? "text-rose-400 font-bold" : "text-emerald-400"}>
                     {droppedRecordsCount}
                   </span>
                 </div>
                 <div className="text-[10px] text-slate-500 pt-1">
-                  Non-volatile fallback stores records across power cycles
+                  Step-by-step FIFO deletes oldest on queue full
                 </div>
               </div>
             </Card>
 
-            {/* 4. Supabase Cloud Database */}
+            {/* 4. Supabase Cloud Database - 500 MB Budget Partition */}
             <Card className="p-4 flex flex-col justify-between border-slate-800 bg-slate-900/60">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                   <Server className="w-3.5 h-3.5 text-emerald-400" />
-                  Supabase Cloud Database
+                  Supabase (500 MB Budget)
                 </span>
                 <Badge variant={isOnline ? 'online' : 'stale'} dot>
                   {isOnline ? 'Active Ingest' : 'Awaiting Ingest'}
                 </Badge>
               </div>
-              <div className="space-y-1 mb-3">
-                <div className="flex items-baseline justify-between">
-                  <span className="text-2xl font-bold font-mono text-slate-100">
-                    {storageDiagnostics?.total_supabase_records !== undefined
-                      ? storageDiagnostics.total_supabase_records.toLocaleString()
-                      : '--'}
-                  </span>
-                  <span className="text-xs font-mono text-slate-400">
-                    rows saved
-                  </span>
+              <div className="space-y-2 mb-2">
+                <div>
+                  <div className="flex justify-between text-xs font-mono mb-1">
+                    <span className="text-slate-300">General Data:</span>
+                    <span className="text-emerald-400 font-semibold">
+                      {storageDiagnostics?.budget?.cloud?.general_data_mb ?? 0.1} / 400 MB
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-emerald-400 h-full rounded-full transition-all duration-500"
+                      style={{ width: `${Math.min(100, Math.max(storageDiagnostics?.budget?.cloud?.general_data_used_pct ?? 0.05, 2))}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="text-xs text-slate-400">
-                  Target: 5-Day Continuous Reliability Testing
+
+                <div>
+                  <div className="flex justify-between text-xs font-mono mb-1">
+                    <span className="text-slate-300">Errors & Events:</span>
+                    <span className="text-rose-400 font-semibold">
+                      {storageDiagnostics?.budget?.cloud?.error_data_mb ?? 0.05} / 100 MB
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-rose-400 h-full rounded-full transition-all duration-500"
+                      style={{ width: `${Math.min(100, Math.max(storageDiagnostics?.budget?.cloud?.error_data_used_pct ?? 0.05, 2))}%` }}
+                    />
+                  </div>
                 </div>
               </div>
               <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
                 <div className="flex justify-between">
-                  <span>Table:</span>
-                  <span className="text-slate-200">public.telemetry</span>
+                  <span>Rows Stored:</span>
+                  <span className="text-slate-200">
+                    {storageDiagnostics?.total_supabase_records !== undefined
+                      ? storageDiagnostics.total_supabase_records.toLocaleString()
+                      : '--'}
+                  </span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Data Path:</span>
-                  <span className="text-emerald-400">Direct HTTPS Ingest</span>
+                  <span>Quota Retention:</span>
+                  <span className="text-emerald-400">FIFO Auto-Pruning</span>
                 </div>
-                <div className="text-[10px] text-slate-500 pt-1">
-                  PostgreSQL with JSONB indexed sensor health telemetry
+                <div className="text-[10px] text-slate-500 pt-0.5">
+                  400 MB general / 100 MB error budget partitioning
                 </div>
               </div>
             </Card>

@@ -119,6 +119,26 @@ export interface TelemetryStats {
   rms_z: { min: number; max: number; avg: number };
 }
 
+export interface StorageBudgetBreakdown {
+  cloud: {
+    general_data_mb: number;
+    general_data_limit_mb: number; // 400 MB
+    general_data_used_pct: number;
+    error_data_mb: number;
+    error_data_limit_mb: number;   // 100 MB
+    error_data_used_pct: number;
+    total_used_mb: number;
+    total_limit_mb: number;        // 500 MB
+    total_used_pct: number;
+  };
+  edge: {
+    total_ceiling_pct: number;           // 90%
+    telemetry_backlog_budget_pct: number;// 85% of active storage
+    error_diagnostics_budget_pct: number;// 15% of active storage
+    fifo_step_deletion_active: boolean;
+  };
+}
+
 export interface StoragePipelineDiagnostics {
   medium?: StorageMedium;
   used_pct?: number;
@@ -133,6 +153,7 @@ export interface StoragePipelineDiagnostics {
   flash_total_bytes?: number | null;
   flash_used_bytes?: number | null;
   flash_free_bytes?: number | null;
+  budget?: StorageBudgetBreakdown;
 }
 
 export interface SystemPerformanceDiagnostics {

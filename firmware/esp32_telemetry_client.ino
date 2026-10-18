@@ -47,7 +47,7 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.5.3-store-first-hw";
+const char *FIRMWARE_VERSION = "1.6.0-quota-fastsync";
 
 // Timing & Cadence Constants
 constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
@@ -55,7 +55,12 @@ constexpr size_t FAST_WINDOW_SAMPLES = 50;           // 50 samples @ 200 Hz = 25
 constexpr uint32_t REPORT_INTERVAL_MS = 5000;        // 5-second telemetry upload cadence
 constexpr uint32_t TEMP_CONV_MS = 750;               // DS18B20 12-bit conversion time
 constexpr uint32_t REDISCOVERY_INTERVAL_MS = 15000;  // 15-second background probe re-scan
-constexpr float STORAGE_CEILING_LIMIT_PCT = 90.0f;   // Strict 90% storage capacity ceiling
+
+// Storage Quotas & Budget Allocation (Aligined with 90% Ceiling Policy)
+constexpr float TOTAL_STORAGE_CEILING_PCT = 90.0f;       // Strict 90% total storage ceiling
+constexpr float ERROR_DIAGNOSTICS_BUDGET_PCT = 15.0f;    // 15% dedicated to error logs, diagnostics & events
+constexpr float TELEMETRY_BACKLOG_BUDGET_PCT = 85.0f;    // 85% of active storage dedicated to telemetry queue
+constexpr float STORAGE_CEILING_LIMIT_PCT = 90.0f;       // Backward compatibility alias
 
 // ADXL345 Registers & Constants
 constexpr uint8_t REG_DEVID = 0x00;
@@ -1285,37 +1290,57 @@ bool initialiseSDCard(bool verbose = true) {
 }
 
 bool enforceStorageCeilingPolicy() {
-  if (storageUsedPct < STORAGE_CEILING_LIMIT_PCT) return true;
+  if (storageUsedPct < TOTAL_STORAGE_CEILING_PCT) return true;
 
-  Serial.printf("[STORAGE-ALERT] Storage reached %.2f%% (>= 90%% ceiling). Pruning oldest records.\n", storageUsedPct);
+  Serial.printf("[STORAGE-ALERT] Storage reached %.2f%% (>= 90%% ceiling). Enforcing 85%% Telemetry / 15%% Error Quota.\n", storageUsedPct);
+
+  // Step-by-step FIFO pruning of oldest queued records (up to 20 files per cycle to prevent blocking)
+  int prunedThisCycle = 0;
+  constexpr int MAX_PRUNE_PER_CYCLE = 20;
 
   if (sdCardReady) {
     File dir = SD.open("/queue");
     if (dir && dir.isDirectory()) {
-      File entry = dir.openNextFile();
-      if (entry) {
-        String path = String("/queue/") + entry.name();
-        entry.close();
-        dir.close();
-        SD.remove(path.c_str());
-        scanOfflineQueue();
-        return (storageUsedPct < STORAGE_CEILING_LIMIT_PCT);
+      while (prunedThisCycle < MAX_PRUNE_PER_CYCLE) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+          String path = String("/queue/") + entry.name();
+          entry.close();
+          SD.remove(path.c_str());
+          prunedThisCycle++;
+          droppedRecordsCount++;
+          if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+        } else {
+          entry.close();
+        }
       }
       dir.close();
+      scanOfflineQueue();
+      Serial.printf("[STORAGE-FIFO] Step-by-step pruned %d oldest telemetry files to protect storage ceiling.\n", prunedThisCycle);
+      return (storageUsedPct < TOTAL_STORAGE_CEILING_PCT);
     }
   } else if (littleFsReady) {
     File dir = LittleFS.open("/lfs_queue");
     if (dir && dir.isDirectory()) {
-      File entry = dir.openNextFile();
-      if (entry) {
-        String path = String("/lfs_queue/") + entry.name();
-        entry.close();
-        dir.close();
-        LittleFS.remove(path.c_str());
-        scanOfflineQueue();
-        return (storageUsedPct < STORAGE_CEILING_LIMIT_PCT);
+      while (prunedThisCycle < MAX_PRUNE_PER_CYCLE) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+          String path = String("/lfs_queue/") + entry.name();
+          entry.close();
+          LittleFS.remove(path.c_str());
+          prunedThisCycle++;
+          droppedRecordsCount++;
+          if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+        } else {
+          entry.close();
+        }
       }
       dir.close();
+      scanOfflineQueue();
+      Serial.printf("[STORAGE-FIFO] Step-by-step pruned %d oldest flash fallback files.\n", prunedThisCycle);
+      return (storageUsedPct < TOTAL_STORAGE_CEILING_PCT);
     }
   }
 
@@ -1603,6 +1628,7 @@ void startWiFiConnection() {
 
   Serial.printf("[WIFI] Connecting to SSID: %s (non-blocking)...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // Disable modem sleep to prevent packet drops in weak signal environments
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWiFiAttemptMs = millis();
 }
@@ -1659,7 +1685,7 @@ int sendTelemetryPayload(const String &jsonPayload, String &responseBody) {
   http.begin(client, SERVER_TELEMETRY_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
-  http.setTimeout(4500);
+  http.setTimeout(6000);
 
   int httpCode = http.POST(jsonPayload);
   if (httpCode > 0) {
@@ -1690,7 +1716,7 @@ int sendDiagnosticEventPayload(const String &jsonPayload) {
   http.begin(client, SERVER_EVENTS_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
-  http.setTimeout(3500);
+  http.setTimeout(6000);
 
   int httpCode = http.POST(jsonPayload);
   if (httpCode > 0) {
@@ -1889,7 +1915,7 @@ void sendDeviceCommandAck(const char *commandId, const char *status, const char 
   http.begin(client, SERVER_COMMANDS_ACK_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
-  http.setTimeout(3500);
+  http.setTimeout(6000);
 
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument ackDoc;
@@ -1929,7 +1955,7 @@ void pollDeviceCommands() {
   http.begin(client, SERVER_COMMANDS_POLL_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_INGEST_TOKEN);
-  http.setTimeout(3500);
+  http.setTimeout(6000);
 
   String pollBody = String("{\"device_id\":\"") + DEVICE_ID + "\"}";
   int httpCode = http.POST(pollBody);
@@ -2048,8 +2074,10 @@ void processBacklogQueue() {
 
     String path = String(dirPath) + "/" + entry.name();
     String entryName = String(entry.name());
-    String content = "";
-    while (entry.available()) content += (char)entry.read();
+    static char s_fileReadBuf[3072];
+    size_t bytesRead = entry.read((uint8_t*)s_fileReadBuf, sizeof(s_fileReadBuf) - 1);
+    s_fileReadBuf[bytesRead] = '\0';
+    String content(s_fileReadBuf);
     entry.close();
     dir.close();
 
@@ -2353,7 +2381,7 @@ void setup() {
 
   // 2. Initialise Mutexes and Realtime Telemetry Queue
   i2cMutex = xSemaphoreCreateMutex();
-  telemetrySnapshotQueue = xQueueCreate(8, sizeof(TelemetrySnapshot));
+  telemetrySnapshotQueue = xQueueCreate(32, sizeof(TelemetrySnapshot));
 
   // 3. Initialise I2C Bus for ADXL345 & DS3231 RTC
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -2385,7 +2413,7 @@ void setup() {
   xTaskCreatePinnedToCore(
       realtimeVibrationTask,
       "RT_VibeEngine",
-      4096,
+      6144, // 6 KB stack headroom for Core 0 real-time sampling & DSP
       nullptr,
       5, // High priority
       &realtimeVibrationTaskHandle,
