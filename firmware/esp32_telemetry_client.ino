@@ -995,12 +995,34 @@ bool initialiseLittleFSFallback() {
 }
 
 bool initialiseSDCard(bool verbose = true) {
-  spiSD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  // Release CS pin from SPIClass hardware ownership so SD library has exclusive control
+  spiSD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, -1);
   pinMode(PIN_SD_CS, OUTPUT);
   digitalWrite(PIN_SD_CS, HIGH);
 
-  if (!SD.begin(PIN_SD_CS, spiSD, SD_SPI_SPEED_HZ)) {
-    if (verbose) Serial.printf("[SD] WARNING: MicroSD mount failed on CS %d. Using LittleFS.\n", PIN_SD_CS);
+  // Try standard reliable frequencies for breadboard / jumper wire setups:
+  // 4 MHz (recommended standard), 10 MHz, 1 MHz (noise-tolerant), 400 kHz (safe mode)
+  const uint32_t trySpeeds[] = { 4000000, 10000000, 1000000, 400000 };
+  bool mounted = false;
+  uint32_t mountedSpeed = 0;
+
+  for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
+    uint32_t speed = trySpeeds[s];
+    // Note: format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32!
+    if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, true)) {
+      mounted = true;
+      mountedSpeed = speed;
+      break;
+    }
+    SD.end();
+    delay(25);
+  }
+
+  if (!mounted) {
+    if (verbose) {
+      Serial.printf("[SD] WARNING: MicroSD mount/init failed on CS %d across 400kHz-10MHz speeds.\n", PIN_SD_CS);
+      Serial.println("[SD] Check: 1) Is card inserted? 2) Wiring (SCK=12, MISO=13, MOSI=14, CS=15). 3) VCC power (3.3V vs 5V for module with onboard LDO).");
+    }
     sdCardReady = false;
     sdCardStatus = "missing";
     if (diagTracker.lastSdState != "missing") {
@@ -1013,8 +1035,9 @@ bool initialiseSDCard(bool verbose = true) {
     return false;
   }
 
-  if (SD.cardType() == CARD_NONE) {
-    if (verbose) Serial.println("[SD] WARNING: No card attached. Using LittleFS.");
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    if (verbose) Serial.println("[SD] WARNING: No card attached in slot. Using LittleFS.");
     sdCardReady = false;
     sdCardStatus = "missing";
     if (diagTracker.lastSdState != "missing") {
@@ -1027,10 +1050,19 @@ bool initialiseSDCard(bool verbose = true) {
     return false;
   }
 
+  const char *typeStr = (cardType == CARD_MMC) ? "MMC" : (cardType == CARD_SD) ? "SDSC" : (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN";
+  uint64_t totalMb = SD.totalBytes() / (1024 * 1024);
+  uint64_t cardMb = SD.cardSize() / (1024 * 1024);
+
   sdCardReady = true;
   sdCardStatus = "ready";
   storageMedium = "sd_card";
   storageUsedPct = calculateStorageUsage(SD.totalBytes(), SD.usedBytes());
+
+  if (verbose) {
+    Serial.printf("[SD] OK: %s Card Detected @ %u kHz! Card Size: %llu MB | FAT Volume: %llu MB (Used: %.2f%%)\n",
+                  typeStr, mountedSpeed / 1000, cardMb, totalMb, storageUsedPct);
+  }
 
   if (diagTracker.lastSdState != "ready") {
     String prevState = diagTracker.lastSdState;
@@ -1038,8 +1070,15 @@ bool initialiseSDCard(bool verbose = true) {
     logDiagnosticEvent("sd_card", "SD_CARD_RECOVERED", "info", prevState.c_str(), "ready", "MicroSD card mounted and verified on SPI bus", nullptr, true);
   }
 
-  if (verbose) {
-    Serial.printf("[SD] OK: MicroSD mounted (Used: %.2f%%)\n", storageUsedPct);
+  // Self-test: verify write and read-back on the SD card
+  File testFile = SD.open("/test_sd.tmp", FILE_WRITE);
+  if (testFile) {
+    testFile.println("ESP32_SD_OK");
+    testFile.close();
+    if (verbose) Serial.println("[SD] Self-Test: Write & Read-back PASSED.");
+    SD.remove("/test_sd.tmp");
+  } else {
+    if (verbose) Serial.println("[SD] WARNING: Write test failed. Card may be write-protected.");
   }
 
   if (!SD.exists("/queue")) SD.mkdir("/queue");
