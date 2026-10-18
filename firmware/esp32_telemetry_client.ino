@@ -995,27 +995,100 @@ bool initialiseLittleFSFallback() {
 }
 
 bool initialiseSDCard(bool verbose = true) {
-  // Release CS pin from SPIClass hardware ownership so SD library has exclusive control
-  spiSD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, -1);
+  // Pre-flight electrical pin diagnostics & active pull-up
+  pinMode(PIN_SD_MISO, INPUT_PULLUP);
+  pinMode(PIN_SD_MOSI, OUTPUT);
+  pinMode(PIN_SD_SCK, OUTPUT);
   pinMode(PIN_SD_CS, OUTPUT);
   digitalWrite(PIN_SD_CS, HIGH);
+  digitalWrite(PIN_SD_MOSI, HIGH);
+  digitalWrite(PIN_SD_SCK, LOW);
 
-  // Try standard reliable frequencies for breadboard / jumper wire setups:
-  // 4 MHz (recommended standard), 10 MHz, 1 MHz (noise-tolerant), 400 kHz (safe mode)
-  const uint32_t trySpeeds[] = { 4000000, 10000000, 1000000, 400000 };
+  int misoIdle = digitalRead(PIN_SD_MISO);
+  if (verbose) {
+    Serial.printf("[SD-DIAG] Pre-flight bus pins: CS=%d(GPIO%d) MOSI=%d(GPIO%d) SCK=%d(GPIO%d) MISO=%d(GPIO%d)\n",
+                  digitalRead(PIN_SD_CS), PIN_SD_CS, digitalRead(PIN_SD_MOSI), PIN_SD_MOSI,
+                  digitalRead(PIN_SD_SCK), PIN_SD_SCK, misoIdle, PIN_SD_MISO);
+    if (misoIdle == LOW) {
+      Serial.println("[SD-DIAG] ALERT: MISO is STUCK LOW! Check for short to GND or unpowered module level shifter.");
+    } else {
+      Serial.println("[SD-DIAG] MISO line pulled HIGH (OK). Sending 100 dummy clock pulses (CS HIGH)...");
+    }
+  }
+
+  // SD SPI Mode Specification requires >= 74 dummy clock cycles with CS held HIGH to enter SPI mode
+  for (int i = 0; i < 100; i++) {
+    digitalWrite(PIN_SD_SCK, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(PIN_SD_SCK, LOW);
+    delayMicroseconds(3);
+  }
+  delay(10);
+
+  // Try both standard (MISO=13, MOSI=14) and swapped (MISO=14, MOSI=13) in case jumper wires are crossed
+  struct SpiPinMap {
+    int miso;
+    int mosi;
+    const char *label;
+  };
+  const SpiPinMap pinMaps[] = {
+    { PIN_SD_MISO, PIN_SD_MOSI, "Standard (MISO=13, MOSI=14)" },
+    { PIN_SD_MOSI, PIN_SD_MISO, "Crossed (MISO=14, MOSI=13)" }
+  };
+
   bool mounted = false;
   uint32_t mountedSpeed = 0;
+  const char *successfulMap = nullptr;
 
-  for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
-    uint32_t speed = trySpeeds[s];
-    // Note: format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32!
-    if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, true)) {
-      mounted = true;
-      mountedSpeed = speed;
-      break;
+  for (size_t m = 0; m < sizeof(pinMaps) / sizeof(pinMaps[0]); m++) {
+    int curMiso = pinMaps[m].miso;
+    int curMosi = pinMaps[m].mosi;
+
+    pinMode(curMiso, INPUT_PULLUP);
+    pinMode(curMosi, OUTPUT);
+    digitalWrite(curMosi, HIGH);
+
+    // Initialize hardware SPI with this pin mapping
+    spiSD.begin(PIN_SD_SCK, curMiso, curMosi, -1);
+    pinMode(curMiso, INPUT_PULLUP);
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+
+    // Direct probe: Send CMD0 and capture the raw 8-byte response
+    digitalWrite(PIN_SD_CS, LOW);
+    spiSD.transfer(0x40); // CMD0
+    spiSD.transfer(0x00);
+    spiSD.transfer(0x00);
+    spiSD.transfer(0x00);
+    spiSD.transfer(0x00);
+    spiSD.transfer(0x95); // CRC7 for CMD0
+    uint8_t raw[8];
+    for (int i = 0; i < 8; i++) {
+      raw[i] = spiSD.transfer(0xFF);
     }
-    SD.end();
-    delay(25);
+    digitalWrite(PIN_SD_CS, HIGH);
+    spiSD.transfer(0xFF);
+
+    if (verbose) {
+      Serial.printf("[SD-DIAG] [%s] Raw CMD0 response: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+                    pinMaps[m].label, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+    }
+
+    const uint32_t trySpeeds[] = { 400000, 1000000, 4000000, 10000000 };
+    for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
+      uint32_t speed = trySpeeds[s];
+      // Note: format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32!
+      if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, true)) {
+        mounted = true;
+        mountedSpeed = speed;
+        successfulMap = pinMaps[m].label;
+        break;
+      }
+      SD.end();
+      delay(30);
+    }
+
+    if (mounted) break;
   }
 
   if (!mounted) {
