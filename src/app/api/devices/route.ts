@@ -48,6 +48,27 @@ export async function GET() {
           ambient_temp: !isOnline && !isStale
             ? 'no_data'
             : (effectiveSensorStatus?.ambient_temp ?? (hasLatestAmbient ? 'ready' : 'not_detected')),
+          sd_card: latest?.sd_card_status ?? dev?.sd_card_status ?? 'missing',
+          rtc: latest?.rtc_status ?? dev?.rtc_status ?? 'not_detected',
+          rtc_synced: latest?.rtc_synced ?? false,
+        };
+
+        const storageDiagnostics = {
+          sd_card: {
+            status: latest?.sd_card_status ?? dev?.sd_card_status ?? 'missing',
+            medium: latest?.storage_medium ?? 'none',
+          },
+          littlefs: {
+            status: latest?.storage_medium === 'flash_littlefs' || (latest?.storage_used_pct !== null && latest?.storage_used_pct !== undefined)
+              ? 'active_fallback'
+              : 'ready',
+            used_pct: latest?.storage_used_pct ?? 0,
+          },
+          queue: {
+            unsynced_count: latest?.unsynced_records_count ?? dev?.unsynced_records_count ?? 0,
+            oldest_pending: latest?.oldest_unsynced_timestamp ?? null,
+            dropped_count: latest?.dropped_records_count ?? 0,
+          },
         };
 
         return {
@@ -59,6 +80,7 @@ export async function GET() {
           is_stale: isStale,
           age_seconds: ageSeconds,
           sensor_health: sensorHealth,
+          storage_diagnostics: storageDiagnostics,
           last_successful_telemetry: latest?.recorded_at ?? dev?.last_seen_at ?? null,
         };
       })

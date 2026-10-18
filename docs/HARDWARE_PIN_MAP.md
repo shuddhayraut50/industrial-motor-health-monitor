@@ -10,13 +10,13 @@
 
 | ESP32-S3 Pin | Subsystem | Signal / Function | Peripheral Bus | Active Level | Electrical Requirements | Verification Method |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GPIO 4** | Diagnostics | Test LED 1 / Vibration Bar #1 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Web Command `LED_TEST_SINGLE` (1) |
-| **GPIO 5** | Diagnostics | Test LED 2 / Vibration Bar #2 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Web Command `LED_TEST_SINGLE` (2) |
-| **GPIO 6** | Diagnostics | Test LED 3 / Vibration Bar #3 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Web Command `LED_TEST_SINGLE` (3) |
-| **GPIO 7** | Diagnostics | Test LED 4 / Vibration Bar #4 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Web Command `LED_TEST_SINGLE` (4) |
-| **GPIO 16** | Diagnostics | Test LED 5 / Vibration Bar #5 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Web Command `LED_TEST_SINGLE` (5) |
-| **GPIO 17** | System Status | **Red Status LED** (Alarm / Fault) | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Steady on critical alarm / Fast blink on sensor error |
-| **GPIO 18** | System Status | **Green Status LED** (Normal / Health) | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Steady on normal / Slow heartbeat during 200 Hz sampling |
+| **GPIO 4** | Diagnostics | Test LED 1 / Vibration Bar #1 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Vibration meter / ADXL double-pulse error |
+| **GPIO 5** | Diagnostics | Test LED 2 / Vibration Bar #2 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Vibration meter / Motor Temp double-pulse error |
+| **GPIO 6** | Diagnostics | Test LED 3 / Vibration Bar #3 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Vibration meter / Ambient Temp double-pulse error |
+| **GPIO 7** | Diagnostics | Test LED 4 / Vibration Bar #4 | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Vibration meter / RTC double-pulse error |
+| **GPIO 16** | Diagnostics | Test LED 5 *(Unpopulated on Bench)* | GPIO Output | LOW (Driven 0V) | Reserved / driven LOW by firmware | N/A (Physically absent on prototype setup) |
+| **GPIO 17** | System Status | **Red Status LED** (Alarm / Fault) | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | OFF (Normal) / 1 Hz blink (Sensor fault) / 2 Hz blink (Warning) / Solid ON (Critical) |
+| **GPIO 18** | System Status | **Green Status LED** (Normal / Health) | GPIO Output | HIGH (3.3V) | 220–330 Ω series resistor to GND | Solid ON (Normal & Connected) / 1 Hz blink (Normal & Offline) / OFF (Alarm) |
 | **GPIO 8** | Sensors | I²C Data (SDA) | Hardware I2C | Bidirectional | Internal/external pull-up to 3.3V | I²C Bus Scan (`0x53` ADXL, `0x68` DS3231) |
 | **GPIO 9** | Sensors | I²C Clock (SCL) | Hardware I2C | 400 kHz Clock | Internal/external pull-up to 3.3V | Clock waveform / 400 kHz timing |
 | **GPIO 10** | Temperature | Motor Stator Probe (DS18B20 #1) | OneWire Bus #1 | Bidirectional | **4.7 kΩ pull-up to 3.3V** | ROM detection & temperature query |

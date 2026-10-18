@@ -53,7 +53,7 @@ constexpr int PIN_TEST_LED_1 = 4;  // Test LED 1 / Vibration Level 1 (Normal)
 constexpr int PIN_TEST_LED_2 = 5;  // Test LED 2 / Vibration Level 2 (Caution)
 constexpr int PIN_TEST_LED_3 = 6;  // Test LED 3 / Vibration Level 3 (Warning)
 constexpr int PIN_TEST_LED_4 = 7;  // Test LED 4 / Vibration Level 4 (High)
-constexpr int PIN_TEST_LED_5 = 16; // Test LED 5 / Vibration Level 5 (Critical)
+constexpr int PIN_TEST_LED_5 = 16; // Test LED 5 (Unpopulated/reserved on bench; forced LOW by firmware)
 
 constexpr int TEST_LEDS[5] = {
     PIN_TEST_LED_1,

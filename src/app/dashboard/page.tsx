@@ -17,6 +17,7 @@ import {
   Wifi,
   Activity,
   HardDrive,
+  Database,
 } from 'lucide-react';
 import Link from 'next/link';
 import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState, ConditionStatus, StorageMedium } from '@/lib/types/telemetry';
@@ -293,14 +294,12 @@ export default function DashboardPage() {
     }
   };
 
-  const getSdBadgeVariant = (state: SdCardState, unsynced: number, medium?: string | null) => {
+  const getSdBadgeVariant = (state: SdCardState, unsynced: number) => {
     if (state === 'ready') {
       return unsynced > 0 ? 'warning' : 'online';
     }
-    if (medium === 'littlefs' || state === 'missing') {
-      return 'warning';
-    }
     switch (state) {
+      case 'missing':
       case 'full':
       case 'write_error':
         return 'offline';
@@ -310,14 +309,13 @@ export default function DashboardPage() {
     }
   };
 
-  const getSdLabel = (state: SdCardState, unsynced: number, medium?: string | null) => {
+  const getSdLabel = (state: SdCardState, unsynced: number) => {
     if (state === 'ready') {
       return unsynced > 0 ? `Buffering (${unsynced})` : 'SD Ready';
     }
-    if (medium === 'littlefs' || state === 'missing') {
-      return 'Flash Fallback';
-    }
     switch (state) {
+      case 'missing':
+        return 'Card Missing';
       case 'full':
         return 'Card Full';
       case 'write_error':
@@ -326,6 +324,20 @@ export default function DashboardPage() {
       default:
         return 'Not Mounted';
     }
+  };
+
+  const getFlashBadgeVariant = (medium: string, usedPct: number) => {
+    if (medium === 'flash_littlefs' || medium === 'littlefs') {
+      return usedPct >= 90 ? 'offline' : 'warning';
+    }
+    return 'online';
+  };
+
+  const getFlashLabel = (medium: string, usedPct: number) => {
+    if (medium === 'flash_littlefs' || medium === 'littlefs') {
+      return usedPct >= 90 ? 'Ceiling Reached' : 'Active Fallback';
+    }
+    return 'Standby Ready';
   };
 
   const getRtcBadgeVariant = (state: RtcState, synced: boolean) => {
@@ -451,7 +463,7 @@ export default function DashboardPage() {
                 </span>
               </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-9 gap-3">
             {/* 1. ESP32 / Device Connection */}
             <Card id="status-card-esp32" className="py-3 px-4 flex flex-col justify-between">
               <div className="flex items-center justify-between">
@@ -585,22 +597,42 @@ export default function DashboardPage() {
               <div className="my-2">
                 <Badge
                   id="badge-status-sdcard"
-                  variant={getSdBadgeVariant(sdCardState, unsyncedCount, storageMedium)}
+                  variant={getSdBadgeVariant(sdCardState, unsyncedCount)}
                   dot
                 >
-                  {getSdLabel(sdCardState, unsyncedCount, storageMedium)}
+                  {getSdLabel(sdCardState, unsyncedCount)}
                 </Badge>
               </div>
               <span className="text-[10px] text-slate-500 font-mono block">
                 {sdCardState === 'ready'
-                  ? (unsyncedCount > 0 ? `${unsyncedCount} unsynced` : `SD Active (${storageUsedPct}% used)`)
-                  : (storageMedium === 'flash_littlefs' || (storageMedium as string) === 'littlefs' || sdCardState === 'missing'
-                    ? `LittleFS Flash (${storageUsedPct}% used)`
-                    : 'SPI FSPI')}
+                  ? `SPI CS 15 (${storageMedium === 'sd_card' ? storageUsedPct + '% used' : 'Ready'})`
+                  : 'SPI CS 15 (FSPI)'}
               </span>
             </Card>
 
-            {/* 7. DS3231 RTC Clock */}
+            {/* 7. Flash Fallback (LittleFS Internal) */}
+            <Card id="status-card-flash" className="py-3 px-4 flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                  Flash Fallback
+                </span>
+                <Database className="w-4 h-4 text-cyan-400" />
+              </div>
+              <div className="my-2">
+                <Badge
+                  id="badge-status-flash"
+                  variant={getFlashBadgeVariant(storageMedium, storageUsedPct)}
+                  dot
+                >
+                  {getFlashLabel(storageMedium, storageUsedPct)}
+                </Badge>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono block">
+                {`LittleFS Flash (${storageUsedPct}% used)`}
+              </span>
+            </Card>
+
+            {/* 8. DS3231 RTC Clock */}
             <Card id="status-card-rtc" className="py-3 px-4 flex flex-col justify-between">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
@@ -898,18 +930,16 @@ export default function DashboardPage() {
             />
             <MetricCard
               id="metric-queue-depth"
-              title="MicroSD Buffer Queue"
+              title="Telemetry Buffer Queue"
               value={String(unsyncedCount)}
               unit="records"
               subValue={
-                sdCardState !== 'ready'
-                  ? `SD Card: ${getSdLabel(sdCardState, unsyncedCount)}`
-                  : unsyncedCount === 0
-                    ? "All offline records synchronized"
-                    : `Oldest pending: ${oldestPendingTimestamp ? new Date(oldestPendingTimestamp).toLocaleTimeString() : 'In queue'}`
+                unsyncedCount === 0
+                  ? "All offline records synchronized"
+                  : `Oldest pending: ${oldestPendingTimestamp ? new Date(oldestPendingTimestamp).toLocaleTimeString() : 'In queue'}`
               }
               status={unsyncedCount > 0 ? 'warning' : 'normal'}
-              sensorState={sdCardState === 'ready' ? 'ready' : 'no_data'}
+              sensorState={unsyncedCount > 0 ? 'error' : 'ready'}
               icon={<HardDrive className="w-4 h-4 text-amber-400" />}
             />
             <MetricCard

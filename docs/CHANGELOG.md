@@ -2,6 +2,42 @@
 
 All notable changes, architectural improvements, and pin mappings for the Industrial Motor Health Monitor are documented in this file.
 
+## [v1.6.0-hardened] — 2026-10-18: Final Engineering Hardening & Production Reliability
+
+### 1. Embedded Firmware Reliability Upgrades (ESP32-S3)
+- **Explicit TLS Socket Teardown:** Added explicit `client.stop()` following `http.end()` across all HTTPS requests (`sendTelemetryPayload`, `sendDiagnosticEventPayload`, `sendDeviceCommandAck`, `pollDeviceCommands`). Prevents TCP socket leaks in `TIME_WAIT` state and fixes the 2-minute connection drop. Verified across 400+ consecutive uploads on COM12.
+- **Enhanced LED State Machine & 4-LED Meter:**
+  - Integrated 4-LED dynamic vibration meter on Test LEDs 1–4: LED 1 OFF (baseline $<0.04g$), slow blink (small variation), medium blink, fast blink, and continuous solid ON ($\ge 0.25g$ or `CRITICAL`).
+  - Added dedicated double-pulse blinking pattern on Test LEDs 1–4 to indicate which sensor probe is disconnected or faulty:
+    - LED 1 (GPIO 4): ADXL345 accelerometer error.
+    - LED 2 (GPIO 5): Motor DS18B20 temp probe error (GPIO 10).
+    - LED 3 (GPIO 6): Ambient DS18B20 temp probe error (GPIO 11).
+    - LED 4 (GPIO 7): DS3231 RTC clock module error (I2C 0x68).
+  - Test LED 5 (GPIO 16) physically unpopulated on bench; firmware forces GPIO 16 LOW and restricts diagnostic chaser sequences to LEDs 1–4.
+  - Green Status LED (GPIO 18): Solid ON when connected and fresh; 1 Hz slow blink (500ms ON / 500ms OFF) when machine is normal but Wi-Fi link is disconnected / logging offline.
+  - Red Status LED (GPIO 17): OFF (Normal); 1 Hz slow blink (Sensor probe fault); 2 Hz fast blink (Vibration warning); Solid ON (Critical alarm).
+- **Backlog Queue HTTP Retry & Quarantine Policy:**
+  - HTTP 2xx & 409 (Conflict): Confirmed accepted / idempotent duplicate already persisted $\rightarrow$ safely remove from queue, reset backoff to 400 ms.
+  - HTTP 400 & 422: Malformed payload / schema mismatch $\rightarrow$ quarantined to `/quarantine` (SD) or `/lfs_quar` (LittleFS) without blocking subsequent live or backlog telemetry.
+  - HTTP 401 & 403: Auth / token failure $\rightarrow$ preserve data in queue, backoff 30 seconds, alert operator.
+  - HTTP 429: Rate limited $\rightarrow$ preserve data, backoff 15 seconds.
+  - HTTP 408, 5xx & Connection Errors: Preserve data, apply bounded exponential backoff up to 60 seconds.
+- **Queue Starvation Resolution:** Decoupled live telemetry from offline queue processing so historical uploads never block or delay live telemetry packets.
+
+### 2. Backend & Dashboard Display Accuracy
+- **MicroSD Buffer vs. Flash Fallback Separation:**
+  - Separated storage status into distinct UI cards in Technical View:
+    1. **MicroSD Buffer:** Authoritatively displays hardware SPI card state: "Card Missing", "Ready", "Mount Failed", or "Card Full" on SPI CS 15.
+    2. **Flash Fallback:** Displays internal LittleFS non-volatile buffer state: "Active Fallback" or "Standby Ready" with actual partition utilization percentage.
+    3. **Telemetry Buffer Queue:** Displays the exact count of pending unsynchronized records and oldest pending timestamp.
+- **Diagnostic Event Idempotency:** Verified deterministic UUID conversion (`toDeterministicUuid`) mapping string event identifiers to valid RFC4122 v4 UUIDs for conflict-safe deduplication in PostgreSQL.
+- **API Enrichments:** Updated `/api/devices` to include explicit `storage_diagnostics` and expanded `sensor_health` fields.
+
+### 3. Documentation & Verification
+- `docs/FINAL_HARDENING_AUDIT.md`: Complete repository audit, Graphify code map link, and root-cause analyses.
+- `docs/FINAL_HARDENING_TEST_REPORT.md`: Comprehensive test report covering Vitest unit tests (65/65 passed), production build, COM12 flashing, and sustained run performance.
+- `docs/LED_BEHAVIOR_GUIDE.md`: Dedicated operator guide detailing LED meanings, blink frequencies, vibration levels, and sensor fault double-pulse codes.
+
 ---
 
 ## [v1.5.0-fast-rt] — 2026-10-17: Urgent Fast Vibration Detection & Immediate LED Driver

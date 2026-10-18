@@ -183,9 +183,18 @@ It is critical to distinguish among the three tiers of latency in the upgraded s
 ### 4.3 Safety Priority Rule for LED Test Modes
 If an operator triggers an LED test sequence (`LED_TEST_ALL` or `LED_TEST_SINGLE`) from the web dashboard while a motor is running:
 - If a `CRITICAL` vibration condition occurs during the test, the firmware **immediately aborts the diagnostic sequence**.
-- All 5 test LEDs switch instantly to the urgent 200 ms non-blocking flash pattern.
+- All physical test LEDs switch instantly to the urgent non-blocking alert pattern.
 - The command acknowledgment reports status `FAILED` with error: `"Safety override: CRITICAL vibration condition detected"`.
 - This guarantees operator safety testing can never suppress an active machinery hazard alert!
+
+### 4.4 4-LED Vibration Meter & Double-Pulse Sensor Fault Codes
+For full details on physical LED mappings, timing, and troubleshooting, see the authoritative [`docs/LED_BEHAVIOR_GUIDE.md`](file:///c:/Users/Shudd/OneDrive/Desktop/Shuddhay/AI%20motor/docs/LED_BEHAVIOR_GUIDE.md).
+- **Green Status LED (GPIO 18):** Solid ON when connected and fresh; 1 Hz slow blink (500ms ON / 500ms OFF) when machine is healthy locally but Wi-Fi link is disconnected / offline.
+- **Red Status LED (GPIO 17):** OFF (Normal); 1 Hz slow blink (Sensor probe fault); 2 Hz fast blink (Vibration warning); Solid ON (Critical alarm).
+- **Test LEDs 1 to 4 (GPIO 4, 5, 6, 7):**
+  - **Diagnostic Fault Mode:** Double-pulse blinking indicates which sensor failed: LED 1 = ADXL345, LED 2 = Motor Temp, LED 3 = Ambient Temp, LED 4 = RTC.
+  - **Dynamic Vibration Meter Mode:** LED 1 OFF (Quiet baseline $<0.04g$), slow blink (small variation $0.04g - 0.08g$), medium blink ($0.08g - 0.15g$), fast blink ($0.15g - 0.25g$), and continuous solid ON across all 4 LEDs ($\ge 0.25g$ or `CRITICAL`).
+- **Test LED 5 (GPIO 16):** Physically unpopulated on test bench setup; driven strictly LOW by firmware.
 
 ---
 

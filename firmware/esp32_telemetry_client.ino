@@ -100,6 +100,12 @@ uint32_t unsyncedRecordsCount = 0;
 uint32_t droppedRecordsCount = 0;
 String oldestUnsyncedTimestamp = "";
 uint32_t recordSequenceNumber = 0;
+volatile float currentFastMaxRms = 0.0f;
+uint32_t backlogBackoffMs = 400;
+uint32_t recordsAcceptedCount = 0;
+uint32_t recordsQuarantinedCount = 0;
+uint32_t recordsRetriedCount = 0;
+uint32_t recordsPreservedCount = 0;
 
 // Configurable Software Alert Thresholds
 struct AlertThresholds {
@@ -659,31 +665,64 @@ void updateLedOutputsImmediate() {
         activeCommandId = "";
       }
     }
-    // 200 ms non-blocking flash across all 5 test LEDs
-    bool flashState = ((now / 200) % 2 == 0);
-    digitalWrite(PIN_TEST_LED_1, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_2, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_3, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_4, flashState ? HIGH : LOW);
-    digitalWrite(PIN_TEST_LED_5, flashState ? HIGH : LOW);
-
-    // Status Red solid, Green off
-    digitalWrite(PIN_LED_RED_FAULT, HIGH);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, LOW);
-    return;
   }
 
-  // Website Diagnostic Test Routine (If not overridden by CRITICAL)
+  // Sensor Health Status
+  bool adxlOk = adxlReady && !adxlError;
+  bool motorTempOk = motorProbeFound && motorTempValid;
+  bool ambientTempOk = ambientProbeFound && ambientTempValid;
+  bool rtcOk = rtcReady;
+  bool anySensorFault = (!adxlOk) || (!motorTempOk) || (!ambientTempOk) || (!rtcOk);
+
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  bool networkFresh = (lastSuccessfulUploadMs > 0 && (now - lastSuccessfulUploadMs) <= 25000);
+
+  // 1. STATUS LEDS: Red (GPIO 17) & Green (GPIO 18)
+  if (currentCondition == "CRITICAL") {
+    // Critical out-of-control vibration: Red SOLID ON, Green OFF
+    digitalWrite(PIN_LED_RED_FAULT, HIGH);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, LOW);
+  } else if (currentCondition == "WARNING") {
+    // Vibration warning: Red fast blink (2 Hz: 250ms ON / 250ms OFF)
+    bool fastBlink = ((now / 250) % 2 == 0);
+    digitalWrite(PIN_LED_RED_FAULT, fastBlink ? HIGH : LOW);
+    digitalWrite(PIN_LED_GREEN_HEALTHY, (wifiOk && networkFresh) ? HIGH : (fastBlink ? HIGH : LOW));
+  } else if (anySensorFault) {
+    // Sensor fault: Red slow blink (1 Hz: 500ms ON / 500ms OFF)
+    bool slowBlink = ((now / 500) % 2 == 0);
+    digitalWrite(PIN_LED_RED_FAULT, slowBlink ? HIGH : LOW);
+    if (wifiOk && networkFresh) {
+      digitalWrite(PIN_LED_GREEN_HEALTHY, HIGH);
+    } else {
+      digitalWrite(PIN_LED_GREEN_HEALTHY, slowBlink ? HIGH : LOW);
+    }
+  } else {
+    // No faults or warnings: Red OFF
+    digitalWrite(PIN_LED_RED_FAULT, LOW);
+    if (wifiOk && networkFresh) {
+      // Everything OK & Wi-Fi connected: Green SOLID ON
+      digitalWrite(PIN_LED_GREEN_HEALTHY, HIGH);
+    } else {
+      // Everything OK locally, but Wi-Fi disconnected / offline: Green SLOW BLINK (1 Hz: 500ms ON / 500ms OFF)
+      bool greenBlink = ((now / 500) % 2 == 0);
+      digitalWrite(PIN_LED_GREEN_HEALTHY, greenBlink ? HIGH : LOW);
+    }
+  }
+
+  // Force LED 5 (GPIO 16) LOW as it is physically unpopulated on test bench
+  digitalWrite(PIN_TEST_LED_5, LOW);
+
+  // Website Diagnostic Test Routine (If active and not CRITICAL)
   if (activeLedTest == LED_TEST_RUNNING_ALL) {
     if (now >= testStepEndMs) {
       testCurrentLedStep++;
-      if (testCurrentLedStep >= TEST_LED_COUNT) {
+      if (testCurrentLedStep >= 4) { // Cycle through 4 physical LEDs (1 to 4)
         for (size_t i = 0; i < TEST_LED_COUNT; i++) digitalWrite(TEST_LEDS[i], LOW);
         activeLedTest = LED_TEST_IDLE;
-        sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":5}", nullptr);
+        sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":4}", nullptr);
         activeCommandId = "";
       } else {
-        for (size_t i = 0; i < TEST_LED_COUNT; i++) {
+        for (size_t i = 0; i < 4; i++) {
           digitalWrite(TEST_LEDS[i], (i == testCurrentLedStep) ? HIGH : LOW);
         }
         testStepEndMs = now + testStepDurationMs;
@@ -701,46 +740,66 @@ void updateLedOutputsImmediate() {
     return;
   }
 
-  // Normal Machine-Side Local Condition Bar (Instantaneous Response)
-  if (currentCondition == "GOOD") {
-    digitalWrite(PIN_TEST_LED_1, HIGH);
-    digitalWrite(PIN_TEST_LED_2, LOW);
-    digitalWrite(PIN_TEST_LED_3, LOW);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
-  } else if (currentCondition == "CHECK") {
-    digitalWrite(PIN_TEST_LED_1, HIGH);
-    digitalWrite(PIN_TEST_LED_2, HIGH);
-    digitalWrite(PIN_TEST_LED_3, LOW);
-    digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
-  } else if (currentCondition == "WARNING") {
+  // 2. DIAGNOSTIC MODE: SENSOR FAULT INDICATION ON TEST LEDS 1-4
+  // Distinctive double-pulse blink indicates exactly which sensor has an error
+  if (anySensorFault && currentCondition != "CRITICAL") {
+    uint32_t cycleMs = now % 1000;
+    // Double pulse: 120ms ON, 120ms OFF, 120ms ON, 640ms OFF
+    bool doublePulse = (cycleMs < 120) || (cycleMs >= 240 && cycleMs < 360);
+
+    // LED 1 (GPIO 4): ADXL345 Accelerometer error
+    digitalWrite(PIN_TEST_LED_1, (!adxlOk && doublePulse) ? HIGH : LOW);
+
+    // LED 2 (GPIO 5): Motor DS18B20 Temp Probe error (GPIO 10)
+    digitalWrite(PIN_TEST_LED_2, (!motorTempOk && doublePulse) ? HIGH : LOW);
+
+    // LED 3 (GPIO 6): Ambient DS18B20 Temp Probe error (GPIO 11)
+    digitalWrite(PIN_TEST_LED_3, (!ambientTempOk && doublePulse) ? HIGH : LOW);
+
+    // LED 4 (GPIO 7): DS3231 RTC Module error (I2C 0x68)
+    digitalWrite(PIN_TEST_LED_4, (!rtcOk && doublePulse) ? HIGH : LOW);
+
+    return;
+  }
+
+  // 3. NORMAL VIBRATION METER / VARIATION LEVEL (All sensors healthy)
+  // Dynamic scale:
+  // - RMS < 0.04g: LED 1 OFF (Quiet / normal baseline)
+  // - 0.04g <= RMS < 0.08g: LED 1 Slow Blink (1 Hz, small variation)
+  // - 0.08g <= RMS < 0.15g: LED 1 ON, LED 2 Medium Blink (3 Hz, moderate vibration)
+  // - 0.15g <= RMS < 0.25g: LED 1 ON, LED 2 ON, LED 3 Fast Blink (6 Hz, warning vibration)
+  // - RMS >= 0.25g or CRITICAL: LEDs 1, 2, 3, 4 Continuous Solid ON (Out-of-control vibration)
+  float rms = currentFastMaxRms;
+
+  if (currentCondition == "CRITICAL" || rms >= alertThresholds.rms_critical_g || rms >= 0.25f) {
     digitalWrite(PIN_TEST_LED_1, HIGH);
     digitalWrite(PIN_TEST_LED_2, HIGH);
     digitalWrite(PIN_TEST_LED_3, HIGH);
+    digitalWrite(PIN_TEST_LED_4, HIGH);
+  } else if (rms >= 0.15f) {
+    bool fastBlink = ((now / 80) % 2 == 0);
+    digitalWrite(PIN_TEST_LED_1, HIGH);
+    digitalWrite(PIN_TEST_LED_2, HIGH);
+    digitalWrite(PIN_TEST_LED_3, fastBlink ? HIGH : LOW);
     digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, LOW);
+  } else if (rms >= 0.08f) {
+    bool medBlink = ((now / 160) % 2 == 0);
+    digitalWrite(PIN_TEST_LED_1, HIGH);
+    digitalWrite(PIN_TEST_LED_2, medBlink ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_3, LOW);
+    digitalWrite(PIN_TEST_LED_4, LOW);
+  } else if (rms >= 0.04f) {
+    bool slowBlink = ((now / 500) % 2 == 0);
+    digitalWrite(PIN_TEST_LED_1, slowBlink ? HIGH : LOW);
+    digitalWrite(PIN_TEST_LED_2, LOW);
+    digitalWrite(PIN_TEST_LED_3, LOW);
+    digitalWrite(PIN_TEST_LED_4, LOW);
   } else {
-    // UNKNOWN / Insufficient Data: slow fault pulse on LED 5
-    bool faultPulse = ((now / 500) % 2 == 0);
+    // Quiet / baseline OK -> LED 1 OFF
     digitalWrite(PIN_TEST_LED_1, LOW);
     digitalWrite(PIN_TEST_LED_2, LOW);
     digitalWrite(PIN_TEST_LED_3, LOW);
     digitalWrite(PIN_TEST_LED_4, LOW);
-    digitalWrite(PIN_TEST_LED_5, faultPulse ? HIGH : LOW);
-  }
-
-  // Status LEDs: Red (GPIO 17) & Green (GPIO 18)
-  bool networkFresh = (lastSuccessfulUploadMs > 0 && (now - lastSuccessfulUploadMs) <= 25000);
-  if (currentCondition == "WARNING") {
-    digitalWrite(PIN_LED_RED_FAULT, HIGH);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, networkFresh ? HIGH : LOW);
-  } else if (!networkFresh) {
-    digitalWrite(PIN_LED_RED_FAULT, HIGH);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, LOW);
-  } else {
-    digitalWrite(PIN_LED_RED_FAULT, LOW);
-    digitalWrite(PIN_LED_GREEN_HEALTHY, HIGH);
   }
 }
 
@@ -797,6 +856,7 @@ void realtimeVibrationTask(void *parameter) {
       float fastRmsX, fastRmsY, fastRmsZ, fastMeanX, fastMeanY, fastMeanZ;
       rollingVibe.calculateRms(fastRmsX, fastRmsY, fastRmsZ, fastMeanX, fastMeanY, fastMeanZ);
       float fastMaxRms = fmaxf(fastRmsX, fmaxf(fastRmsY, fastRmsZ));
+      currentFastMaxRms = fastMaxRms;
       bool hasVib = (adxlReady && rollingVibe.count >= 10);
 
       fastEvaluateCondition(
@@ -1645,78 +1705,96 @@ void processBacklogQueue() {
   if (now < nextBacklogUploadAttemptMs) return;
   if (now - lastSuccessfulUploadMs < 2000) return;
 
+  auto processEntry = [&](bool isSD, const char *dirPath, const char *quarPath) -> bool {
+    File dir = isSD ? SD.open(dirPath) : LittleFS.open(dirPath);
+    if (!dir || !dir.isDirectory()) return false;
+
+    File entry = dir.openNextFile();
+    if (!entry) {
+      dir.close();
+      unsyncedRecordsCount = 0;
+      return false;
+    }
+
+    String path = String(dirPath) + "/" + entry.name();
+    String entryName = String(entry.name());
+    String content = "";
+    while (entry.available()) content += (char)entry.read();
+    entry.close();
+    dir.close();
+
+    if (content.length() == 0) {
+      if (isSD) SD.remove(path.c_str());
+      else LittleFS.remove(path.c_str());
+      if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+      return true;
+    }
+
+    String resStr;
+    int httpCode = sendTelemetryPayload(content, resStr);
+
+    if ((httpCode >= 200 && httpCode < 300) || httpCode == 409) {
+      // 2xx or 409: Confirmed accepted / idempotent duplicate already persisted
+      if (isSD) SD.remove(path.c_str());
+      else LittleFS.remove(path.c_str());
+      if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+      recordsAcceptedCount++;
+      backlogBackoffMs = 400;
+      nextBacklogUploadAttemptMs = now + 400;
+      return true;
+    } else if (httpCode == 400 || httpCode == 422) {
+      // 400/422: Malformed payload / schema mismatch. Quarantine so queue is not blocked
+      Serial.printf("[QUEUE] Quarantining invalid record %s (HTTP %d): %s\n", path.c_str(), httpCode, resStr.c_str());
+      if (isSD) {
+        if (!SD.exists(quarPath)) SD.mkdir(quarPath);
+        String qPath = String(quarPath) + "/" + entryName;
+        File qf = SD.open(qPath.c_str(), FILE_WRITE);
+        if (qf) {
+          qf.print(content);
+          qf.close();
+        }
+        SD.remove(path.c_str());
+      } else {
+        if (!LittleFS.exists(quarPath)) LittleFS.mkdir(quarPath);
+        String qPath = String(quarPath) + "/" + entryName;
+        File qf = LittleFS.open(qPath.c_str(), FILE_WRITE);
+        if (qf) {
+          qf.print(content);
+          qf.close();
+        }
+        LittleFS.remove(path.c_str());
+      }
+      if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+      recordsQuarantinedCount++;
+      backlogBackoffMs = 400;
+      nextBacklogUploadAttemptMs = now + 400;
+      return true;
+    } else if (httpCode == 401 || httpCode == 403) {
+      // 401/403: Auth failure. DO NOT DISCARD. Preserve in queue, alert operator, backoff 30s
+      Serial.printf("[QUEUE-AUTH-ALERT] HTTP %d Auth failure! Preserving backlog data. Retrying in 30s.\n", httpCode);
+      recordsPreservedCount++;
+      nextBacklogUploadAttemptMs = now + 30000;
+      return false;
+    } else if (httpCode == 429) {
+      // 429: Rate limited. Preserve and backoff 15s
+      Serial.printf("[QUEUE] Rate limit exceeded (HTTP 429). Retrying in 15s.\n");
+      recordsRetriedCount++;
+      nextBacklogUploadAttemptMs = now + 15000;
+      return false;
+    } else {
+      // 408, 5xx, or network timeout/socket error: Retry with bounded exponential backoff
+      recordsRetriedCount++;
+      backlogBackoffMs = (backlogBackoffMs * 2 > 60000) ? 60000 : backlogBackoffMs * 2;
+      Serial.printf("[QUEUE] Transient error (HTTP %d). Backing off %u ms.\n", httpCode, backlogBackoffMs);
+      nextBacklogUploadAttemptMs = now + backlogBackoffMs;
+      return false;
+    }
+  };
+
   if (sdCardReady) {
-    File dir = SD.open("/queue");
-    if (!dir || !dir.isDirectory()) return;
-
-    File entry = dir.openNextFile();
-    if (!entry) {
-      dir.close();
-      unsyncedRecordsCount = 0;
-      return;
-    }
-
-    String path = String("/queue/") + entry.name();
-    String content = "";
-    while (entry.available()) content += (char)entry.read();
-    entry.close();
-    dir.close();
-
-    if (content.length() > 0) {
-      String resStr;
-      int httpCode = sendTelemetryPayload(content, resStr);
-      if (httpCode >= 200 && httpCode < 300) {
-        SD.remove(path.c_str());
-        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        nextBacklogUploadAttemptMs = now + 400;
-        return;
-      } else if (httpCode >= 400 && httpCode < 500) {
-        Serial.printf("[QUEUE] Discarding unrecoverable record %s (HTTP %d): %s\n", path.c_str(), httpCode, resStr.c_str());
-        SD.remove(path.c_str());
-        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        nextBacklogUploadAttemptMs = now + 400;
-        return;
-      } else {
-        nextBacklogUploadAttemptMs = now + 5000;
-        return;
-      }
-    }
+    processEntry(true, "/queue", "/quarantine");
   } else if (littleFsReady) {
-    File dir = LittleFS.open("/lfs_queue");
-    if (!dir || !dir.isDirectory()) return;
-
-    File entry = dir.openNextFile();
-    if (!entry) {
-      dir.close();
-      unsyncedRecordsCount = 0;
-      return;
-    }
-
-    String path = String("/lfs_queue/") + entry.name();
-    String content = "";
-    while (entry.available()) content += (char)entry.read();
-    entry.close();
-    dir.close();
-
-    if (content.length() > 0) {
-      String resStr;
-      int httpCode = sendTelemetryPayload(content, resStr);
-      if (httpCode >= 200 && httpCode < 300) {
-        LittleFS.remove(path.c_str());
-        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        nextBacklogUploadAttemptMs = now + 400;
-        return;
-      } else if (httpCode >= 400 && httpCode < 500) {
-        Serial.printf("[QUEUE] Discarding unrecoverable record %s (HTTP %d): %s\n", path.c_str(), httpCode, resStr.c_str());
-        LittleFS.remove(path.c_str());
-        if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
-        nextBacklogUploadAttemptMs = now + 400;
-        return;
-      } else {
-        nextBacklogUploadAttemptMs = now + 5000;
-        return;
-      }
-    }
+    processEntry(false, "/lfs_queue", "/lfs_quar");
   }
 }
 

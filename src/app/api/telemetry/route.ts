@@ -72,6 +72,7 @@ export async function POST(request: NextRequest) {
     // 7. Persist to database
     const savedRecord = await insertTelemetry({
       ...payload,
+      sensor_status: payload.sensor_status || undefined,
       recorded_at: authoritativeRecordedAt,
     });
 
