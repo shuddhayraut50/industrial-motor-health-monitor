@@ -218,7 +218,11 @@ export function SimpleMotorView({
           </div>
           <span className="text-xs text-slate-400">
             {ambientSensorState === 'ready'
-              ? (tempDiff !== null ? `Thermal Rise: +${tempDiff} °C above room` : 'Ambient reference OK')
+              ? (tempDiff !== null
+                  ? (Number(tempDiff) < 0
+                      ? `Thermal Rise: ${Number(tempDiff).toFixed(1)} °C (Motor cooler than ambient)`
+                      : `Thermal Rise: +${Number(tempDiff).toFixed(1)} °C above room`)
+                  : 'Ambient reference OK')
               : 'Ambient probe not detected (Motor monitoring unaffected)'}
           </span>
         </Card>

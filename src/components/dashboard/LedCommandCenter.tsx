@@ -142,7 +142,7 @@ export function LedCommandCenter({ deviceId, isOnline }: LedCommandCenterProps) 
           <p className="text-xs text-slate-400">
             Sequentially illuminates LED 1 through 5 in safe 500 ms intervals while non-blocking 200 Hz vibration sampling continues uninterrupted.
           </p>
-          <div className="flex gap-2 pt-1">
+          <div className="flex flex-wrap gap-2 pt-1">
             <Button
               id="btn-test-all-leds"
               variant="primary"

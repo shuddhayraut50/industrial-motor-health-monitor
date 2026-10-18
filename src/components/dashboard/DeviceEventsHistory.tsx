@@ -392,13 +392,13 @@ export function DeviceEventsHistory({
                   </div>
 
                   {/* Diagnostic Message */}
-                  <div className="text-xs text-slate-300 mt-2 pl-8">
+                  <div className="text-xs text-slate-300 mt-2 pl-2 sm:pl-8 break-words">
                     {ev.diagnostic_message}
                   </div>
 
                   {/* Expanded Details Drawer */}
                   {isExpanded && (
-                    <div className="mt-3 pt-3 border-t border-slate-800/80 pl-8 space-y-2 text-xs font-mono text-slate-300">
+                    <div className="mt-3 pt-3 border-t border-slate-800/80 pl-2 sm:pl-8 space-y-2 text-xs font-mono text-slate-300 break-words">
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 bg-slate-900/80 p-2.5 rounded border border-slate-800">
                         <div>
                           <span className="text-slate-500 block text-[10px]">EVENT ID:</span>

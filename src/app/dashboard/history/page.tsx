@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/Button';
 import { TemperatureChart } from '@/components/charts/TemperatureChart';
 import { VibrationRmsChart } from '@/components/charts/VibrationRmsChart';
 import { TelemetryRecord, TelemetryStats } from '@/lib/types/telemetry';
+import { calculateSignedThermalRise } from '@/lib/utils/temperature';
 import { Download, Filter, Calendar, BarChart2, Table as TableIcon } from 'lucide-react';
 
 export default function HistoryPage() {
@@ -305,15 +306,17 @@ export default function HistoryPage() {
               <tbody className="divide-y divide-slate-800/60">
                 {paginatedRecords.length > 0 ? (
                   paginatedRecords.map((r) => {
-                    const diff = (Number(r.motor_temp_c) - Number(r.ambient_temp_c)).toFixed(2);
+                    const rise = calculateSignedThermalRise(r.motor_temp_c, r.ambient_temp_c);
                     return (
                       <tr key={r.id} className="hover:bg-slate-800/40 transition-colors">
                         <td className="py-2 px-3 text-slate-300">
                           {new Date(r.recorded_at).toLocaleString()}
                         </td>
-                        <td className="py-2 px-3 text-rose-400">{r.motor_temp_c}</td>
-                        <td className="py-2 px-3 text-cyan-400">{r.ambient_temp_c}</td>
-                        <td className="py-2 px-3 text-amber-400">+{diff}</td>
+                        <td className="py-2 px-3 text-rose-400">{r.motor_temp_c !== null ? `${Number(r.motor_temp_c).toFixed(1)}` : '--'}</td>
+                        <td className="py-2 px-3 text-cyan-400">{r.ambient_temp_c !== null ? `${Number(r.ambient_temp_c).toFixed(1)}` : '--'}</td>
+                        <td className="py-2 px-3 text-amber-400 font-mono" title={rise.explanation}>
+                          {rise.formatted}
+                        </td>
                         <td className="py-2 px-3 text-sky-400">{r.rms_x_g}</td>
                         <td className="py-2 px-3 text-purple-400">{r.rms_y_g}</td>
                         <td className="py-2 px-3 text-emerald-400">{r.rms_z_g}</td>

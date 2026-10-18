@@ -73,6 +73,12 @@ export const TemperatureChart: React.FC<TemperatureChartProps> = ({
             formatter={(value: unknown, name: unknown) => {
               if (name === 'motor_temp') return [`${Number(value).toFixed(2)} °C`, 'Motor Temp'];
               if (name === 'ambient_temp') return [`${Number(value).toFixed(2)} °C`, 'Ambient Temp'];
+              if (name === 'diff') {
+                const num = Number(value);
+                const signStr = num > 0 ? `+${num.toFixed(2)}` : `${num.toFixed(2)}`;
+                const note = num < 0 ? ' (Motor cooler than ambient)' : '';
+                return [`${signStr} °C${note}`, 'Thermal Rise (ΔT)'];
+              }
               return [String(value), String(name)];
             }}
           />
@@ -100,6 +106,16 @@ export const TemperatureChart: React.FC<TemperatureChartProps> = ({
             strokeWidth={2}
             dot={false}
             activeDot={{ r: 5 }}
+            isAnimationActive={false}
+          />
+          <Line
+            type="monotone"
+            dataKey="diff"
+            name="Thermal Rise (ΔT)"
+            stroke="#f59e0b"
+            strokeWidth={1.5}
+            strokeDasharray="4 4"
+            dot={false}
             isAnimationActive={false}
           />
         </LineChart>

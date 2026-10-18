@@ -47,7 +47,7 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.5.0-fast-rt";
+const char *FIRMWARE_VERSION = "1.5.1-hardened";
 
 // Timing & Cadence Constants
 constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
@@ -186,7 +186,58 @@ struct PerformanceMetrics {
   uint32_t missedSampleSlots = 0;
   uint32_t queueOverflowCount = 0;
   UBaseType_t realtimeTaskStackWatermark = 0;
+
+  // Brownout, reset, heap, and network diagnostics
+  esp_reset_reason_t resetReason = ESP_RST_UNKNOWN;
+  const char *resetReasonStr = "UNKNOWN";
+  uint32_t minFreeHeapBytes = 0;
+  uint32_t currentFreeHeapBytes = 0;
+  uint32_t largestFreeHeapBlockBytes = 0;
+  uint32_t wifiDisconnectCount = 0;
+  int wifiLastDisconnectReason = 0;
+  const char *wifiLastDisconnectReasonStr = "NONE";
+  uint32_t rtcReadErrorsCount = 0;
+  uint32_t lastSuccessfulRtcReadMs = 0;
+  uint32_t lastSuccessfulTimeSyncMs = 0;
 } perfMetrics;
+
+const char* getResetReasonString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN";
+    case ESP_RST_SW:        return "SW_RESET";
+    case ESP_RST_PANIC:     return "EXCEPTION_PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
+const char* getWifiDisconnectReasonString(int reason) {
+  switch (reason) {
+    case 1:   return "UNSPECIFIED";
+    case 2:   return "AUTH_EXPIRE";
+    case 3:   return "AUTH_LEAVE";
+    case 4:   return "ASSOC_EXPIRE";
+    case 5:   return "ASSOC_TOOMANY";
+    case 6:   return "NOT_AUTHED";
+    case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE";
+    case 9:   return "ASSOC_NOT_AUTHED";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+    case 200: return "BEACON_TIMEOUT";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default:  return "DISCONNECTED";
+  }
+}
 
 // ==============================================================================
 // FAST ROLLING RMS ACCUMULATOR (O(1) Circular Buffer for 250 ms Window)
@@ -325,6 +376,40 @@ uint32_t testStepDurationMs = 500;
 int activeSingleLedPin = -1;
 String activeCommandId = "";
 
+// Volatile thread-safe Wi-Fi state for Core 0 LED driver (0 lock contention)
+volatile bool g_wifiConnected = false;
+
+// Decoupled asynchronous command ACK queue for Core 0 safety
+struct PendingCommandAck {
+  char commandId[64];
+  char status[16];
+  char resultJson[128];
+  char errorMessage[128];
+  volatile bool hasResultJson;
+  volatile bool hasErrorMessage;
+  volatile bool pending;
+};
+static PendingCommandAck g_pendingCmdAck = { "", "", "", "", false, false, false };
+
+inline void queueCommandAck(const char *commandId, const char *status, const char *resultJson, const char *errorMessage) {
+  if (!commandId || strlen(commandId) == 0) return;
+  strncpy(g_pendingCmdAck.commandId, commandId, sizeof(g_pendingCmdAck.commandId) - 1);
+  strncpy(g_pendingCmdAck.status, status, sizeof(g_pendingCmdAck.status) - 1);
+  if (resultJson) {
+    strncpy(g_pendingCmdAck.resultJson, resultJson, sizeof(g_pendingCmdAck.resultJson) - 1);
+    g_pendingCmdAck.hasResultJson = true;
+  } else {
+    g_pendingCmdAck.hasResultJson = false;
+  }
+  if (errorMessage) {
+    strncpy(g_pendingCmdAck.errorMessage, errorMessage, sizeof(g_pendingCmdAck.errorMessage) - 1);
+    g_pendingCmdAck.hasErrorMessage = true;
+  } else {
+    g_pendingCmdAck.hasErrorMessage = false;
+  }
+  g_pendingCmdAck.pending = true;
+}
+
 // Forward Declarations
 void sendDeviceCommandAck(const char *commandId, const char *status, const char *resultJson, const char *errorMessage);
 void pollDeviceCommands();
@@ -441,17 +526,22 @@ bool readAcceleration(float &xG, float &yG, float &zG) {
 // DS3231 HARDWARE RTC & TIME SYNCHRONIZATION
 // ==============================================================================
 bool initialiseDS3231(bool verbose = true) {
+  static uint8_t s_rtcConsecutiveErrors = 0;
   if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
 
   Wire.beginTransmission(DS3231_I2C_ADDR);
   if (Wire.endTransmission() != 0) {
-    if (verbose) Serial.println("[DS3231] WARNING: RTC module not detected on I2C address 0x68.");
-    rtcReady = false;
-    rtcStatus = "not_detected";
-    if (diagTracker.lastRtcState != "not_detected") {
-      String prevState = diagTracker.lastRtcState;
-      diagTracker.lastRtcState = "not_detected";
-      logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "not_detected", "DS3231 RTC not detected on I2C address 0x68", nullptr, false);
+    s_rtcConsecutiveErrors++;
+    perfMetrics.rtcReadErrorsCount++;
+    if (s_rtcConsecutiveErrors >= 3) {
+      if (verbose) Serial.println("[DS3231] WARNING: RTC module not detected on I2C address 0x68 (3 consecutive failures).");
+      rtcReady = false;
+      rtcStatus = "not_detected";
+      if (diagTracker.lastRtcState != "not_detected") {
+        String prevState = diagTracker.lastRtcState;
+        diagTracker.lastRtcState = "not_detected";
+        logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "not_detected", "DS3231 RTC not detected on I2C address 0x68 after 3 attempts", nullptr, false);
+      }
     }
     if (i2cMutex) xSemaphoreGive(i2cMutex);
     return false;
@@ -476,7 +566,9 @@ bool initialiseDS3231(bool verbose = true) {
     uint16_t y = 2000 + bcd2dec(Wire.read());
 
     if (y >= 2025 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      s_rtcConsecutiveErrors = 0;
       rtcReady = true;
+      perfMetrics.lastSuccessfulRtcReadMs = millis();
       if (verbose) {
         Serial.printf("[DS3231] OK: Hardware RTC clock valid: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
                       y, mo, d, h, m, s);
@@ -500,12 +592,15 @@ bool initialiseDS3231(bool verbose = true) {
         settimeofday(&tv, nullptr);
       }
     } else {
-      rtcReady = false;
-      rtcStatus = "invalid_time";
-      if (diagTracker.lastRtcState != "invalid_time") {
-        String prevState = diagTracker.lastRtcState;
-        diagTracker.lastRtcState = "invalid_time";
-        logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "invalid_time", "DS3231 oscillator stopped or invalid date (<2025)", nullptr, false);
+      s_rtcConsecutiveErrors++;
+      if (s_rtcConsecutiveErrors >= 3) {
+        rtcReady = false;
+        rtcStatus = "invalid_time";
+        if (diagTracker.lastRtcState != "invalid_time") {
+          String prevState = diagTracker.lastRtcState;
+          diagTracker.lastRtcState = "invalid_time";
+          logDiagnosticEvent("rtc", "RTC_INVALID", "warning", prevState.c_str(), "invalid_time", "DS3231 oscillator stopped or invalid date (<2025)", nullptr, false);
+        }
       }
     }
   }
@@ -661,7 +756,7 @@ void updateLedOutputsImmediate() {
     if (activeLedTest != LED_TEST_IDLE) {
       activeLedTest = LED_TEST_IDLE; // Abort diagnostic test immediately
       if (activeCommandId.length() > 0) {
-        sendDeviceCommandAck(activeCommandId.c_str(), "FAILED", nullptr, "Safety override: CRITICAL vibration condition detected");
+        queueCommandAck(activeCommandId.c_str(), "FAILED", nullptr, "Safety override: CRITICAL vibration condition detected");
         activeCommandId = "";
       }
     }
@@ -674,7 +769,7 @@ void updateLedOutputsImmediate() {
   bool rtcOk = rtcReady;
   bool anySensorFault = (!adxlOk) || (!motorTempOk) || (!ambientTempOk) || (!rtcOk);
 
-  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  bool wifiOk = g_wifiConnected;
   bool networkFresh = (lastSuccessfulUploadMs > 0 && (now - lastSuccessfulUploadMs) <= 25000);
 
   // 1. STATUS LEDS: Red (GPIO 17) & Green (GPIO 18)
@@ -719,7 +814,7 @@ void updateLedOutputsImmediate() {
       if (testCurrentLedStep >= 4) { // Cycle through 4 physical LEDs (1 to 4)
         for (size_t i = 0; i < TEST_LED_COUNT; i++) digitalWrite(TEST_LEDS[i], LOW);
         activeLedTest = LED_TEST_IDLE;
-        sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":4}", nullptr);
+        queueCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"leds_tested\":4}", nullptr);
         activeCommandId = "";
       } else {
         for (size_t i = 0; i < 4; i++) {
@@ -733,7 +828,7 @@ void updateLedOutputsImmediate() {
     if (now >= testStepEndMs) {
       if (activeSingleLedPin >= 0) digitalWrite(activeSingleLedPin, LOW);
       activeLedTest = LED_TEST_IDLE;
-      sendDeviceCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"pulse_completed\":true}", nullptr);
+      queueCommandAck(activeCommandId.c_str(), "SUCCEEDED", "{\"pulse_completed\":true}", nullptr);
       activeCommandId = "";
       activeSingleLedPin = -1;
     }
@@ -1393,7 +1488,35 @@ void checkSensorRecovery() {
 // NON-BLOCKING WI-FI WITH EXPONENTIAL BACKOFF
 // ==============================================================================
 void startWiFiConnection() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (g_wifiConnected) return;
+
+  static bool eventRegistered = false;
+  if (!eventRegistered) {
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+      switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+          g_wifiConnected = true;
+          diagTracker.wifiFailCount = 0;
+          Serial.printf("[WIFI] Connected! IP: %s | RSSI: %d dBm\n",
+                        WiFi.localIP().toString().c_str(), WiFi.RSSI());
+          break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+          g_wifiConnected = false;
+          perfMetrics.wifiDisconnectCount++;
+          perfMetrics.wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
+          perfMetrics.wifiLastDisconnectReasonStr = getWifiDisconnectReasonString(info.wifi_sta_disconnected.reason);
+          Serial.printf("[WIFI] Link Lost! Reason: %d (%s) | Disconnect Count: %u\n",
+                        perfMetrics.wifiLastDisconnectReason,
+                        perfMetrics.wifiLastDisconnectReasonStr,
+                        perfMetrics.wifiDisconnectCount);
+          break;
+        default:
+          break;
+      }
+    });
+    eventRegistered = true;
+  }
+
   Serial.printf("[WIFI] Connecting to SSID: %s (non-blocking)...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1401,7 +1524,7 @@ void startWiFiConnection() {
 }
 
 void maintainWiFiAsync() {
-  if (WiFi.status() == WL_CONNECTED) {
+  if (g_wifiConnected) {
     if (diagTracker.lastWifiState != "connected") {
       String prevState = diagTracker.lastWifiState;
       diagTracker.lastWifiState = "connected";
@@ -1421,13 +1544,17 @@ void maintainWiFiAsync() {
 
   if (diagTracker.lastWifiState == "connected") {
     diagTracker.lastWifiState = "disconnected";
-    logDiagnosticEvent("wifi", "WIFI_DISCONNECTED", "warning", "connected", "disconnected", "Wi-Fi link dropped, entering reconnect backoff", nullptr, false);
+    char discDetails[128];
+    snprintf(discDetails, sizeof(discDetails), "{\"reason_code\":%d,\"reason_str\":\"%s\",\"disconnect_count\":%u}",
+             perfMetrics.wifiLastDisconnectReason, perfMetrics.wifiLastDisconnectReasonStr, perfMetrics.wifiDisconnectCount);
+    logDiagnosticEvent("wifi", "WIFI_DISCONNECTED", "warning", "connected", "disconnected", "Wi-Fi link dropped, entering reconnect backoff", discDetails, false);
   }
 
   uint32_t now = millis();
   if (now - lastWiFiAttemptMs >= wifiBackoffMs) {
     lastWiFiAttemptMs = now;
-    Serial.printf("[WIFI] Reconnecting (backoff: %u ms)...\n", wifiBackoffMs);
+    Serial.printf("[WIFI] Reconnecting (backoff: %u ms | Last Reason: %s)...\n",
+                  wifiBackoffMs, perfMetrics.wifiLastDisconnectReasonStr);
     WiFi.disconnect();
     WiFi.reconnect();
     // Bounded exponential backoff up to 60s
@@ -1597,22 +1724,16 @@ void logDiagnosticEvent(
   Serial.printf("[DIAG-EVENT] [%s] %s (%s -> %s): %s\n",
                 component, eventCode, prevState ? prevState : "none", newState, diagnosticMsg);
 
-  // If connected, attempt direct upload
-  if (WiFi.status() == WL_CONNECTED) {
-    int httpCode = sendDiagnosticEventPayload(payload);
-    if (httpCode >= 200 && httpCode < 300) {
-      return;
-    }
-  }
-
-  // Otherwise queue locally for resilient sync
+  // Decoupled queuing: Always write to local non-volatile storage first.
+  // This guarantees zero-blocking execution on Core 1 when vibration alerts trigger,
+  // prevents TLS socket contention with telemetry uploads, and ensures event durability across resets.
   saveDiagnosticEventToQueue(String(eventId), payload);
 }
 
 void processEventsQueue() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!g_wifiConnected) return;
   uint32_t now = millis();
-  if (now - diagTracker.lastEventSyncMs < 4000) return;
+  if (now - diagTracker.lastEventSyncMs < 1500) return;
   if (now - lastSuccessfulUploadMs < 1500) return;
   diagTracker.lastEventSyncMs = now;
 
@@ -1629,11 +1750,11 @@ void processEventsQueue() {
           entry.close();
 
           int code = sendDiagnosticEventPayload(content);
-          if ((code >= 200 && code < 300) || (code >= 400 && code < 500)) {
+          if ((code >= 200 && code < 300) || code == 400 || code == 422) {
             SD.remove(filepath.c_str());
             count++;
           } else {
-            break; // Stop batch if network failed
+            break; // Retain event file on network or 401/403/429/5xx errors
           }
         } else {
           entry.close();
@@ -1658,11 +1779,11 @@ void processEventsQueue() {
           entry.close();
 
           int code = sendDiagnosticEventPayload(content);
-          if ((code >= 200 && code < 300) || (code >= 400 && code < 500)) {
+          if ((code >= 200 && code < 300) || code == 400 || code == 422) {
             LittleFS.remove(filepath.c_str());
             count++;
           } else {
-            break;
+            break; // Retain event file on network or 401/403/429/5xx errors
           }
         } else {
           entry.close();
@@ -1714,7 +1835,7 @@ void sendDeviceCommandAck(const char *commandId, const char *status, const char 
 }
 
 void pollDeviceCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!g_wifiConnected) return;
   if (activeLedTest != LED_TEST_IDLE) return;
 
   WiFiClientSecure client;
@@ -1825,7 +1946,7 @@ void pollDeviceCommands() {
 }
 
 void processBacklogQueue() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!g_wifiConnected) return;
   uint32_t now = millis();
   if (now < nextBacklogUploadAttemptMs) return;
   if (now - lastSuccessfulUploadMs < 2000) return;
@@ -1946,9 +2067,9 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   if (measuredAt.length() > 0) doc["measured_at"] = measuredAt;
   else doc["measured_at"] = nullptr;
 
-  int wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -120;
+  int wifiRssi = g_wifiConnected ? WiFi.RSSI() : -120;
   if (wifiRssi > 0) wifiRssi = -120;
-  if (WiFi.status() == WL_CONNECTED) doc["wifi_rssi_dbm"] = wifiRssi;
+  if (g_wifiConnected) doc["wifi_rssi_dbm"] = wifiRssi;
   else doc["wifi_rssi_dbm"] = nullptr;
 
   if (snap.hasMotorTemp) doc["motor_temp_c"] = snap.motorTemp;
@@ -2007,7 +2128,7 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   bool synced = false;
 
   // Direct upload of live telemetry snapshot whenever Wi-Fi is connected
-  if (WiFi.status() == WL_CONNECTED) {
+  if (g_wifiConnected) {
     String responseStr;
     int httpCode = sendTelemetryPayload(payload, responseStr);
     if (httpCode >= 200 && httpCode < 300) {
@@ -2051,10 +2172,20 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  esp_reset_reason_t rstReason = esp_reset_reason();
+  perfMetrics.resetReason = rstReason;
+  perfMetrics.resetReasonStr = getResetReasonString(rstReason);
+
   Serial.println("\n========================================================");
   Serial.println("  Industrial Motor Health Monitor — Fast ESP32 Firmware ");
   Serial.println("  Device: " + String(DEVICE_ID) + " | FW: " + String(FIRMWARE_VERSION));
   Serial.println("  Hardware: ESP32-S3 N16R8 Dual-Core 240MHz");
+  Serial.printf("  Reset Reason: %d (%s)\n", (int)rstReason, perfMetrics.resetReasonStr);
+  Serial.printf("  Initial Free Heap: %u B | Min Free: %u B | Max Block: %u B\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+  if (rstReason == ESP_RST_BROWNOUT) {
+    Serial.println("  [ALERT] BROWNOUT RESET DETECTED! Check external 5V/2A power supply rails!");
+  }
   Serial.println("========================================================");
 
   // 1. Authoritative Hardware Pin Configuration
@@ -2096,7 +2227,15 @@ void setup() {
   lastCommandPollMs = millis();
   lastPerfLogMs = millis();
 
-  logDiagnosticEvent("esp32", "CONTROLLER_BOOTED", "info", "power_on", "running", "ESP32-S3 firmware initialized and runtime active", nullptr, true);
+  char bootDetails[128];
+  snprintf(bootDetails, sizeof(bootDetails),
+           "{\"reset_reason\":\"%s\",\"free_heap\":%u,\"min_free\":%u}",
+           perfMetrics.resetReasonStr, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  logDiagnosticEvent("esp32", (rstReason == ESP_RST_BROWNOUT) ? "BROWNOUT_DETECTED" : "CONTROLLER_BOOTED",
+                     (rstReason == ESP_RST_BROWNOUT) ? "critical" : "info",
+                     perfMetrics.resetReasonStr, "running",
+                     (rstReason == ESP_RST_BROWNOUT) ? "Brownout reset occurred: supply voltage dropped below threshold" : "ESP32-S3 firmware initialized and runtime active",
+                     bootDetails, true);
 
   Serial.println("[SYSTEM] Real-time monitoring active. Entering background loop.\n");
 }
@@ -2110,6 +2249,17 @@ void loop() {
   checkSensorRecovery();
   processBacklogQueue();
   processEventsQueue();
+
+  // Asynchronous Command ACK Dispatcher on Core 1 (Insulates Core 0)
+  if (g_pendingCmdAck.pending && g_wifiConnected) {
+    g_pendingCmdAck.pending = false;
+    sendDeviceCommandAck(
+      g_pendingCmdAck.commandId,
+      g_pendingCmdAck.status,
+      g_pendingCmdAck.hasResultJson ? g_pendingCmdAck.resultJson : nullptr,
+      g_pendingCmdAck.hasErrorMessage ? g_pendingCmdAck.errorMessage : nullptr
+    );
+  }
 
   // Edge-triggered vibration classifier state change detection (thread-safe, executed on Core 1)
   if (currentCondition != diagTracker.lastClassifierState) {
@@ -2138,6 +2288,10 @@ void loop() {
   // Periodic Low-Overhead Performance Metrics Log (every 5 seconds)
   if (now - lastPerfLogMs >= 5000) {
     lastPerfLogMs = now;
+    perfMetrics.currentFreeHeapBytes = ESP.getFreeHeap();
+    perfMetrics.minFreeHeapBytes = ESP.getMinFreeHeap();
+    perfMetrics.largestFreeHeapBlockBytes = ESP.getMaxAllocHeap();
+
     Serial.println("--------------------------------------------------------------------------------");
     Serial.printf("[PERF-STATS] Sample Interval: %u us (Min: %u | Max: %u) | Exec: %u us\n",
                   perfMetrics.sampleIntervalUs, perfMetrics.minSampleIntervalUs,
@@ -2146,9 +2300,12 @@ void loop() {
                   perfMetrics.fastRmsCalcDurationUs, perfMetrics.conditionToLedLatencyUs);
     Serial.printf("[PERF-STATS] SD Write: %u ms | HTTPS Upload: %u ms | Overflow: %u | Core0 Stack Free: %u B\n",
                   perfMetrics.lastSdWriteDurationMs, perfMetrics.lastUploadDurationMs,
-                  perfMetrics.queueOverflowCount, perfMetrics.realtimeTaskStackWatermark);
-    Serial.printf("[PERF-STATS] Condition: %s (%s)\n",
-                  currentCondition.c_str(), currentConditionReason.c_str());
+                  perfMetrics.queueOverflowCount, (uint32_t)perfMetrics.realtimeTaskStackWatermark);
+    Serial.printf("[PERF-STATS] Heap Free: %u B (Min: %u B | Max Block: %u B) | Wi-Fi Disconnects: %u\n",
+                  perfMetrics.currentFreeHeapBytes, perfMetrics.minFreeHeapBytes,
+                  perfMetrics.largestFreeHeapBlockBytes, perfMetrics.wifiDisconnectCount);
+    Serial.printf("[PERF-STATS] Reset Reason: %s | RTC Read Errors: %u | Condition: %s\n",
+                  perfMetrics.resetReasonStr, perfMetrics.rtcReadErrorsCount, currentCondition.c_str());
     Serial.println("--------------------------------------------------------------------------------");
   }
 

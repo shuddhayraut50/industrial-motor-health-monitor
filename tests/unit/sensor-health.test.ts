@@ -138,6 +138,43 @@ describe('Independent Sensor Health & Fault-Tolerant Statistics', () => {
     expect(stats.temp_diff.avg).toBe(26.5);
   });
 
+  it('correctly handles signed negative thermal rise when motor is cooler than ambient', () => {
+    const records: TelemetryRecord[] = [
+      {
+        id: 1,
+        device_id: 'motor-monitor-001',
+        recorded_at: new Date(Date.now() - 2000).toISOString(),
+        motor_temp_c: 27.0,
+        ambient_temp_c: 31.0,
+        ax_g: 0.01,
+        ay_g: 0.01,
+        az_g: 0.99,
+        rms_x_g: 0.01,
+        rms_y_g: 0.01,
+        rms_z_g: 0.01,
+      },
+      {
+        id: 2,
+        device_id: 'motor-monitor-001',
+        recorded_at: new Date(Date.now() - 1000).toISOString(),
+        motor_temp_c: 26.0,
+        ambient_temp_c: 32.0,
+        ax_g: 0.01,
+        ay_g: 0.01,
+        az_g: 0.99,
+        rms_x_g: 0.01,
+        rms_y_g: 0.01,
+        rms_z_g: 0.01,
+      },
+    ];
+
+    const stats = computeStats(records);
+    // 27 - 31 = -4.0, 26 - 32 = -6.0
+    expect(stats.temp_diff.min).toBe(-6.0);
+    expect(stats.temp_diff.max).toBe(-4.0);
+    expect(stats.temp_diff.avg).toBe(-5.0);
+  });
+
   it('computes vibration RMS accurately when ADXL345 reports valid measurements', () => {
     const records: TelemetryRecord[] = [
       {

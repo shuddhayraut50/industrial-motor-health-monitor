@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import Link from 'next/link';
 import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState, ConditionStatus, StorageMedium } from '@/lib/types/telemetry';
+import { calculateSignedThermalRise } from '@/lib/utils/temperature';
 import { SimpleMotorView } from '@/components/dashboard/SimpleMotorView';
 import { LedCommandCenter } from '@/components/dashboard/LedCommandCenter';
 import { DeviceEventsHistory } from '@/components/dashboard/DeviceEventsHistory';
@@ -207,9 +208,11 @@ export default function DashboardPage() {
 
   const motorTemp = isMotorCurrentAndValid ? Number(latest.motor_temp_c).toFixed(1) : null;
   const ambTemp = isAmbientCurrentAndValid ? Number(latest.ambient_temp_c).toFixed(1) : null;
-  const tempDiff = (isMotorCurrentAndValid && isAmbientCurrentAndValid)
-    ? (Number(latest.motor_temp_c) - Number(latest.ambient_temp_c)).toFixed(1)
-    : null;
+  const signedThermalRise = calculateSignedThermalRise(
+    isMotorCurrentAndValid ? latest?.motor_temp_c : null,
+    isAmbientCurrentAndValid ? latest?.ambient_temp_c : null
+  );
+  const tempDiff = signedThermalRise.value !== null ? signedThermalRise.value.toFixed(1) : null;
 
   const rmsX = isAdxlCurrentAndValid ? Number(latest.rms_x_g).toFixed(4) : null;
   const rmsY = isAdxlCurrentAndValid ? Number(latest.rms_y_g).toFixed(4) : null;
@@ -250,14 +253,6 @@ export default function DashboardPage() {
     : (!isOnline || isStale)
       ? 'no_data'
       : (sensorHealth.adxl345 === 'error' ? 'error' : 'not_detected');
-
-  const tempDiffSubValue = (isMotorCurrentAndValid && isAmbientCurrentAndValid)
-    ? 'Motor Temp minus Ambient Temp'
-    : (!isMotorCurrentAndValid && !isAmbientCurrentAndValid)
-      ? 'Both temperature probes unavailable'
-      : !isAmbientCurrentAndValid
-        ? 'Requires ambient probe (not detected)'
-        : 'Requires motor probe (not detected)';
 
   const formatAge = (sec: number | null) => {
     if (sec === null) return 'No packets';
@@ -379,7 +374,7 @@ export default function DashboardPage() {
         isRefreshing={isRefreshing}
       />
 
-      <div className="p-6 max-w-7xl mx-auto space-y-6">
+      <div className="p-3 sm:p-6 max-w-7xl mx-auto space-y-6">
         {/* Simple / Technical View Switch */}
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
           <div className="flex items-center gap-2">
@@ -730,9 +725,9 @@ export default function DashboardPage() {
             <MetricCard
               id="metric-temp-diff"
               title="Thermal Rise (ΔT)"
-              value={tempDiff !== null ? `+${tempDiff}` : null}
-              unit="°C"
-              subValue={tempDiffSubValue}
+              value={isMotorCurrentAndValid && isAmbientCurrentAndValid ? signedThermalRise.formattedValueOnly : null}
+              unit={isMotorCurrentAndValid && isAmbientCurrentAndValid ? '°C' : undefined}
+              subValue={signedThermalRise.explanation}
               status={isStale ? 'stale' : 'normal'}
               sensorState={isMotorCurrentAndValid && isAmbientCurrentAndValid ? 'ready' : 'not_detected'}
               icon={<Gauge className="w-4 h-4 text-amber-400" />}

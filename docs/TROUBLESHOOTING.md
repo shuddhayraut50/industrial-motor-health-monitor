@@ -167,3 +167,65 @@ If Serial reports `[SD] MicroSD initialization failed!`:
    - Test LED 5: GPIO 16
    - Status Red:  GPIO 17
    - Status Green: GPIO 18
+
+---
+
+## 8. Vibration-Induced False Offline & Task Contention
+
+### 8.1 Symptom & Root Cause
+- **Symptom:** When vibration increases or alerts fire, the web dashboard suddenly marks the device `STALE` or `OFFLINE`, even though the ESP32 remains powered on and Wi-Fi is technically connected.
+- **Mechanism Discovered in Audit:**
+  1. **Cross-Core LwIP Lock Contention:** Calling `WiFi.status()` inside Core 0's fast LED loop (`updateLedOutputsImmediate()`) locked the internal FreeRTOS mutex against Core 1's network stack, stalling TLS uploads.
+  2. **Blocking Synchronous TLS Uploads on Events:** Whenever an alert state triggered, `logDiagnosticEvent()` and `sendDeviceCommandAck()` attempted synchronous HTTPS POST requests directly on Core 1, consuming 2,500–3,500 ms each. Back-to-back events delayed the periodic 5-second telemetry upload past the cloud's 25-second `ONLINE` threshold.
+- **Remedy (Implemented in v1.5.1-hardened):**
+  1. **Decoupled Wi-Fi Status:** Core 0 reads a non-blocking `volatile bool g_wifiConnected` flag maintained asynchronously via `WiFi.onEvent()` callbacks.
+  2. **Decoupled Event Queueing:** `logDiagnosticEvent()` never calls TLS directly. It serializes the event to `/events/` on SD/LittleFS in <10 ms. Core 1 drains the queue during network idle intervals when no telemetry upload is scheduled.
+  3. **Asynchronous Command ACKs:** Command ACKs are pushed to an in-memory queue (`queueCommandAck`) and uploaded asynchronously in `loop()`.
+
+---
+
+## 9. Signed Thermal Rise ($\Delta T = T_{\text{motor}} - T_{\text{ambient}}$)
+
+### 9.1 Physics of Negative Temperature Difference
+In industrial facilities, ambient air temperatures can exceed cold motor surface temperatures (e.g. idle motor in a 36°C workshop reads 31°C).
+- $\Delta T = 31.0^\circ\text{C} - 36.0^\circ\text{C} = -5.0^\circ\text{C}$.
+- **Mathematical Rule:** Never take `Math.abs(deltaT)`. A negative $\Delta T$ is physically valid and indicates the motor surface is cooler than ambient.
+
+### 9.2 Dashboard Formatting Rules (`src/lib/utils/temperature.ts`)
+- **Positive $\Delta T$:** Display with explicit `+` sign (e.g., `+12.0 °C`).
+- **Negative $\Delta T$:** Display with minus sign (e.g., `-5.0 °C`) and explanatory tooltip/subtext: *"Motor surface is 5.0 °C cooler than ambient"*. Do NOT flag as a fault or warning solely because $\Delta T < 0$.
+- **Zero $\Delta T$:** Display as `0.0 °C`.
+- **Missing/Faulty Probe:** Display `Unavailable` (not `0.0 °C`).
+
+---
+
+## 10. Brownout Detection & Boot Reset Reason Diagnostics
+
+### 10.1 Boot Reset Reasons
+Upon boot, the firmware logs `[SYSTEM] Reset reason: <REASON>` and transmits it in telemetry (`reset_reason`).
+- `ESP_RST_POWERON` (1): Clean cold boot from power-on.
+- `ESP_RST_SW` (3): Intentional software reboot via `esp_restart()`.
+- `ESP_RST_PANIC` (4): Software crash / kernel panic / unhandled exception.
+- `ESP_RST_INT_WDT` (5): Interrupt Watchdog triggered (task locked with interrupts disabled).
+- `ESP_RST_TASK_WDT` (6): Task Watchdog triggered (FreeRTOS task starved or stuck in infinite loop).
+- `ESP_RST_BROWNOUT` (9): **Brownout Detector triggered**. Supply voltage on 3.3V dropped below 2.80V.
+
+### 10.2 Resolving Brownout Resets (`ESP_RST_BROWNOUT`)
+If reset reason is `ESP_RST_BROWNOUT`:
+1. Confirm external 5V supply is powering the breadboard with short, thick wires.
+2. Ensure MicroSD card module VCC is connected to external 5V (feeding the module's LDO), not the ESP32 3.3V pin.
+3. Verify common ground wire between ESP32 GND and external supply GND is firmly seated.
+4. Add a 470 µF low-ESR electrolytic capacitor across the breadboard power rail.
+
+---
+
+## 11. DS3231 RTC Intermittent Detection & Glitch Filtering
+
+### 11.1 Symptom & Noise Sensitivity
+- **Symptom:** The dashboard or serial logs periodically report `RTC Offline` or `probe_rtc: false` for one reading cycle, then recover immediately.
+- **Root Cause:** Transient I2C noise caused by adjacent high-speed SPI activity or breadboard contact resistance causes a single `Wire.endTransmission()` NACK at address `0x68`.
+- **Remedy (v1.5.1-hardened):**
+  1. **3-Strike Glitch Filter:** The firmware requires **3 consecutive read failures** before setting `rtcReady = false` or alerting the cloud.
+  2. **Clock Validity Check:** The firmware verifies that `year >= 2024` and registers are non-zero before marking time as valid.
+  3. **Bus Integrity:** Verify pull-up resistors on SDA (GPIO 8) and SCL (GPIO 9) are between 2.2 kΩ and 4.7 kΩ.
+

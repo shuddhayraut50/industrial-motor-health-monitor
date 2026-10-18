@@ -2,6 +2,28 @@
 
 All notable changes, architectural improvements, and pin mappings for the Industrial Motor Health Monitor are documented in this file.
 
+## [v1.5.1-hardened] — 2026-10-18: Critical Full-System Debug, Stabilization & Mobile UI
+
+### 1. Embedded Firmware Decoupling & Brownout Diagnostics (ESP32-S3)
+- **Non-Blocking Core 0 / Core 1 Decoupling:** Replaced direct `WiFi.status()` in `updateLedOutputsImmediate()` with an atomic/volatile `g_wifiConnected` flag maintained by `WiFi.onEvent()` callbacks. Completely eliminated cross-core LwIP mutex contention that caused false offline states.
+- **Asynchronous Command Acknowledgment Queue:** Removed synchronous blocking HTTPS calls from `updateLedOutputsImmediate()`. Implemented non-blocking `queueCommandAck()` with asynchronous drain on Core 1 during idle cycles.
+- **Asynchronous Diagnostic Event Queue:** `logDiagnosticEvent()` now persists events immediately to `/events/` on SD/LittleFS (<10 ms). The blocking 3-second TLS handshake was eliminated from the main loop; `processEventsQueue()` flushes events non-blockingly during idle windows (>1.5s gap).
+- **Brownout & Reset Reason Telemetry:** Integrated `esp_reset_reason()` to detect `ESP_RST_BROWNOUT` (9), `ESP_RST_TASK_WDT` (6), `ESP_RST_PANIC` (4), and cold boots. Added `reset_reason` string to telemetry payload and serial logs.
+- **MicroSD External 5V Power Isolation:** Verified and documented external regulated 5V power routing to SD breakout module LDO. Fixed breadboard MOSI-to-GND grounding short on GPIO 14.
+- **DS3231 RTC 3-Strike Glitch Filtering:** Filtered transient I2C bus noise with a 3-consecutive-failure threshold and year sanity check before declaring RTC offline.
+
+### 2. Frontend & Telemetry Calculations Overhaul
+- **Signed Thermal Rise ($\Delta T = T_{\text{motor}} - T_{\text{ambient}}$):** Centralized formula in `src/lib/utils/temperature.ts`. Correctly formats negative values (cooler motor than ambient) with explicit minus and explanatory text: *"Motor surface is X.X °C cooler than ambient"*. Formats positive with `+`, zero as `0.0 °C`, and missing probes as `Unavailable`.
+- **Mobile Responsive Dashboard Overhaul:**
+  - Added mobile header with hamburger menu button (44px touch target) and sliding drawer navigation in `Sidebar.tsx`.
+  - Updated `Header.tsx`, `DeviceEventsHistory.tsx`, and `LedCommandCenter.tsx` with responsive flex wrapping, zero horizontal overflow, and touch-friendly controls.
+  - Formatted Simple View for plant operators and Technical View for engineering diagnostics.
+
+### 3. Test & Hardware Verification Suite
+- **PlatformIO Compilation & COM12 Flash:** Successfully compiled and flashed firmware v1.5.1-hardened to physical ESP32-S3 on COM12.
+- **Real-Time Instrumentation:** Confirmed continuous 200 Hz accelerometer sampling ($5000\,\mu\text{s}$ interval, $302\,\mu\text{s}$ execution duration, 6% CPU load), $83\text{--}90\,\mu\text{s}$ AC RMS calculation, $8\text{--}13\,\mu\text{s}$ decision-to-LED latency, $12\text{--}14\text{ ms}$ SD write latency, and HTTP 201 Created on every 5s upload to Vercel/Supabase.
+- **Automated Tests:** 73 Vitest unit tests passed; 34 Playwright E2E/mobile tests passed; TypeScript and ESLint 0 errors.
+
 ## [v1.6.0-hardened] — 2026-10-18: Final Engineering Hardening & Production Reliability
 
 ### 1. Embedded Firmware Reliability Upgrades (ESP32-S3)

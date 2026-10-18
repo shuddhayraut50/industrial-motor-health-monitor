@@ -57,12 +57,13 @@
   * DATA (Yellow): Connect to **GPIO 11** with a **4.7 kΩ pull-up resistor** tied to **3.3V**.
 
 ### 2.4 MicroSD Card SPI Adapter (FSPI)
-* **VCC:** Connect to ESP32 **3.3V** (Ensure adapter has 3.3V logic; generic modules with 5V LDOs may require 5V VCC, but logic signals must remain 3.3V).
-* **GND:** Connect to ESP32 **GND**.
+* **VCC:** Connect to **External Regulated 5V Rail** (Recommended for modules with onboard AMS1117/XC6206 3.3V LDO). Avoid powering from ESP32 3.3V pin to prevent voltage droop during peak write surges (>100 mA).
+* **GND:** Connect to ESP32 **GND** (Common Star Ground with external 5V PSU).
 * **SCK:** Connect to ESP32 **GPIO 12**.
 * **MISO:** Connect to ESP32 **GPIO 13**.
-* **MOSI:** Connect to ESP32 **GPIO 14**.
+* **MOSI:** Connect to ESP32 **GPIO 14** (Ensure physical pin clearance from adjacent ground rail on breadboard).
 * **CS:** Connect to ESP32 **GPIO 15**.
+* **Logic Level:** 3.3V logic only. ESP32-S3 GPIOs must never be subjected to 5V signals. Standard modules with resistor dividers or 74LVC125 level shifters safely interface with 3.3V logic.
 
 ---
 

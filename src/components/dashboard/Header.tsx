@@ -41,7 +41,7 @@ export const Header: React.FC<HeaderProps> = ({
   const statusLabel = isOnline ? 'Live Ingestion' : isStale ? 'Stale' : 'Offline';
 
   return (
-    <header className="h-16 border-b border-slate-800 bg-slate-950/70 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-20">
+    <header className="h-16 border-b border-slate-800 bg-slate-950/70 backdrop-blur-md px-3 sm:px-6 flex items-center justify-between sticky top-0 z-20">
       {/* Left: Device Selector & Status */}
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-2">
