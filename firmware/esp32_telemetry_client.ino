@@ -994,101 +994,159 @@ bool initialiseLittleFSFallback() {
   return false;
 }
 
-bool initialiseSDCard(bool verbose = true) {
-  // Pre-flight electrical pin diagnostics & active pull-up
-  pinMode(PIN_SD_MISO, INPUT_PULLUP);
-  pinMode(PIN_SD_MOSI, OUTPUT);
-  pinMode(PIN_SD_SCK, OUTPUT);
-  pinMode(PIN_SD_CS, OUTPUT);
-  digitalWrite(PIN_SD_CS, HIGH);
-  digitalWrite(PIN_SD_MOSI, HIGH);
-  digitalWrite(PIN_SD_SCK, LOW);
+// Bit-banged SPI CMD0 probe to check if SD card silicon responds on specific pins
+static uint8_t probeSdCardCmd0(int sckPin, int mosiPin, int misoPin, int csPin) {
+  pinMode(csPin, OUTPUT);
+  pinMode(sckPin, OUTPUT);
+  pinMode(mosiPin, OUTPUT);
+  pinMode(misoPin, INPUT_PULLUP);
 
-  int misoIdle = digitalRead(PIN_SD_MISO);
-  if (verbose) {
-    Serial.printf("[SD-DIAG] Pre-flight bus pins: CS=%d(GPIO%d) MOSI=%d(GPIO%d) SCK=%d(GPIO%d) MISO=%d(GPIO%d)\n",
-                  digitalRead(PIN_SD_CS), PIN_SD_CS, digitalRead(PIN_SD_MOSI), PIN_SD_MOSI,
-                  digitalRead(PIN_SD_SCK), PIN_SD_SCK, misoIdle, PIN_SD_MISO);
-    if (misoIdle == LOW) {
-      Serial.println("[SD-DIAG] ALERT: MISO is STUCK LOW! Check for short to GND or unpowered module level shifter.");
-    } else {
-      Serial.println("[SD-DIAG] MISO line pulled HIGH (OK). Sending 100 dummy clock pulses (CS HIGH)...");
+  digitalWrite(csPin, HIGH);
+  digitalWrite(mosiPin, HIGH);
+  digitalWrite(sckPin, LOW);
+
+  // Send 80 dummy clock cycles with CS HIGH to wake SD controller
+  for (int i = 0; i < 80; i++) {
+    digitalWrite(sckPin, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(sckPin, LOW);
+    delayMicroseconds(3);
+  }
+
+  // Assert CS LOW
+  digitalWrite(csPin, LOW);
+  delayMicroseconds(5);
+
+  // Send CMD0 (0x40, 0x00, 0x00, 0x00, 0x00, 0x95)
+  const uint8_t cmd0[] = { 0x40, 0x00, 0x00, 0x00, 0x00, 0x95 };
+  for (size_t b = 0; b < sizeof(cmd0); b++) {
+    uint8_t byteVal = cmd0[b];
+    for (int bit = 7; bit >= 0; bit--) {
+      digitalWrite(mosiPin, (byteVal & (1 << bit)) ? HIGH : LOW);
+      digitalWrite(sckPin, HIGH);
+      delayMicroseconds(3);
+      digitalWrite(sckPin, LOW);
+      delayMicroseconds(3);
     }
   }
 
-  // SD SPI Mode Specification requires >= 74 dummy clock cycles with CS held HIGH to enter SPI mode
-  for (int i = 0; i < 100; i++) {
-    digitalWrite(PIN_SD_SCK, HIGH);
-    delayMicroseconds(3);
-    digitalWrite(PIN_SD_SCK, LOW);
-    delayMicroseconds(3);
+  // Read response bytes (looking specifically for 0x01: R1_IDLE_STATE)
+  digitalWrite(mosiPin, HIGH);
+  uint8_t resp = 0xFF;
+  for (int i = 0; i < 32; i++) {
+    uint8_t byteIn = 0;
+    for (int bit = 7; bit >= 0; bit--) {
+      digitalWrite(sckPin, HIGH);
+      delayMicroseconds(3);
+      if (digitalRead(misoPin)) {
+        byteIn |= (1 << bit);
+      }
+      digitalWrite(sckPin, LOW);
+      delayMicroseconds(3);
+    }
+    if (byteIn == 0x01) {
+      resp = byteIn;
+      break;
+    }
   }
-  delay(10);
 
-  // Try both standard (MISO=13, MOSI=14) and swapped (MISO=14, MOSI=13) in case jumper wires are crossed
-  struct SpiPinMap {
-    int miso;
-    int mosi;
-    const char *label;
+  // De-assert CS HIGH and send 8 clocks to release bus
+  digitalWrite(csPin, HIGH);
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(sckPin, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(sckPin, LOW);
+    delayMicroseconds(2);
+  }
+
+  return resp;
+}
+
+bool initialiseSDCard(bool verbose = true) {
+  // Comprehensive electrical diagnostics on bus pins
+  pinMode(12, INPUT_PULLUP); delay(2); int p12_pu = digitalRead(12);
+  pinMode(12, INPUT_PULLDOWN); delay(2); int p12_pd = digitalRead(12);
+
+  pinMode(13, INPUT_PULLUP); delay(2); int p13_pu = digitalRead(13);
+  pinMode(13, INPUT_PULLDOWN); delay(2); int p13_pd = digitalRead(13);
+
+  pinMode(14, INPUT_PULLUP); delay(2); int p14_pu = digitalRead(14);
+  pinMode(14, INPUT_PULLDOWN); delay(2); int p14_pd = digitalRead(14);
+
+  pinMode(15, INPUT_PULLUP); delay(2); int p15_pu = digitalRead(15);
+  pinMode(15, INPUT_PULLDOWN); delay(2); int p15_pd = digitalRead(15);
+
+  if (verbose) {
+    Serial.printf("[PIN-ELECTRICAL] SCK(GPIO12): PU=%d PD=%d | MISO(GPIO13): PU=%d PD=%d | MOSI(GPIO14): PU=%d PD=%d | CS(GPIO15): PU=%d PD=%d\n",
+                  p12_pu, p12_pd, p13_pu, p13_pd, p14_pu, p14_pd, p15_pu, p15_pd);
+    if (p13_pu == 0 && p13_pd == 0) Serial.println("[PIN-ALERT] GPIO 13 is SHORTED TO GROUND!");
+    if (p14_pu == 0 && p14_pd == 0) Serial.println("[PIN-ALERT] GPIO 14 is SHORTED TO GROUND!");
+    if (p15_pu == 0 && p15_pd == 0) Serial.println("[PIN-ALERT] GPIO 15 is SHORTED TO GROUND!");
+  }
+
+  // Fast auto-scan: test common pin wiring permutations in case breadboard wires are crossed
+  const struct { int sck; int mosi; int miso; } spiCombos[] = {
+    { 12, 14, 13 }, // Standard (SCK=12, MOSI=14, MISO=13)
+    { 12, 13, 14 }, // Swapped data (SCK=12, MOSI=13, MISO=14)
+    { 14, 12, 13 }, // SCK on 14, MOSI on 12
+    { 14, 13, 12 }, // SCK on 14, MOSI on 13
+    { 13, 14, 12 }, // SCK on 13
+    { 13, 12, 14 }
   };
-  const SpiPinMap pinMaps[] = {
-    { PIN_SD_MISO, PIN_SD_MOSI, "Standard (MISO=13, MOSI=14)" },
-    { PIN_SD_MOSI, PIN_SD_MISO, "Crossed (MISO=14, MOSI=13)" }
-  };
+  const int csCandidates[] = { 15, 5, 4, 16, 21, 2 };
+
+  int bestSck = PIN_SD_SCK;
+  int bestMosi = PIN_SD_MOSI;
+  int bestMiso = PIN_SD_MISO;
+  int bestCs = PIN_SD_CS;
+  bool foundAlive = false;
+
+  for (size_t c = 0; c < sizeof(spiCombos) / sizeof(spiCombos[0]); c++) {
+    for (size_t k = 0; k < sizeof(csCandidates) / sizeof(csCandidates[0]); k++) {
+      uint8_t r = probeSdCardCmd0(spiCombos[c].sck, spiCombos[c].mosi, spiCombos[c].miso, csCandidates[k]);
+      if (r == 0x01) {
+        if (verbose) {
+          Serial.printf("[SD-AUTOSCAN] GENUINE SD CARD FOUND! Responded 0x01 (In Idle State) on SCK=%d, MOSI=%d, MISO=%d, CS=%d\n",
+                        spiCombos[c].sck, spiCombos[c].mosi, spiCombos[c].miso, csCandidates[k]);
+        }
+        bestSck = spiCombos[c].sck;
+        bestMosi = spiCombos[c].mosi;
+        bestMiso = spiCombos[c].miso;
+        bestCs = csCandidates[k];
+        foundAlive = true;
+        break;
+      }
+    }
+    if (foundAlive) break;
+  }
+
+  if (!foundAlive && verbose) {
+    Serial.println("[SD-AUTOSCAN] No genuine 0x01 idle response across 36 pin combinations.");
+  }
+
+  // Restore configured CS pin state
+  digitalWrite(PIN_SD_CS, HIGH);
+
+  // Initialize hardware SPI with discovered or standard pins
+  spiSD.begin(bestSck, bestMiso, bestMosi, -1);
+  pinMode(bestMiso, INPUT_PULLUP);
+  pinMode(bestCs, OUTPUT);
+  digitalWrite(bestCs, HIGH);
 
   bool mounted = false;
   uint32_t mountedSpeed = 0;
-  const char *successfulMap = nullptr;
+  const uint32_t trySpeeds[] = { 400000, 1000000, 4000000, 10000000 };
 
-  for (size_t m = 0; m < sizeof(pinMaps) / sizeof(pinMaps[0]); m++) {
-    int curMiso = pinMaps[m].miso;
-    int curMosi = pinMaps[m].mosi;
-
-    pinMode(curMiso, INPUT_PULLUP);
-    pinMode(curMosi, OUTPUT);
-    digitalWrite(curMosi, HIGH);
-
-    // Initialize hardware SPI with this pin mapping
-    spiSD.begin(PIN_SD_SCK, curMiso, curMosi, -1);
-    pinMode(curMiso, INPUT_PULLUP);
-    pinMode(PIN_SD_CS, OUTPUT);
-    digitalWrite(PIN_SD_CS, HIGH);
-
-    // Direct probe: Send CMD0 and capture the raw 8-byte response
-    digitalWrite(PIN_SD_CS, LOW);
-    spiSD.transfer(0x40); // CMD0
-    spiSD.transfer(0x00);
-    spiSD.transfer(0x00);
-    spiSD.transfer(0x00);
-    spiSD.transfer(0x00);
-    spiSD.transfer(0x95); // CRC7 for CMD0
-    uint8_t raw[8];
-    for (int i = 0; i < 8; i++) {
-      raw[i] = spiSD.transfer(0xFF);
+  for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
+    uint32_t speed = trySpeeds[s];
+    // format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32
+    if (SD.begin(bestCs, spiSD, speed, "/sd", 5, true)) {
+      mounted = true;
+      mountedSpeed = speed;
+      break;
     }
-    digitalWrite(PIN_SD_CS, HIGH);
-    spiSD.transfer(0xFF);
-
-    if (verbose) {
-      Serial.printf("[SD-DIAG] [%s] Raw CMD0 response: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
-                    pinMaps[m].label, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-    }
-
-    const uint32_t trySpeeds[] = { 400000, 1000000, 4000000, 10000000 };
-    for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
-      uint32_t speed = trySpeeds[s];
-      // Note: format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32!
-      if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, true)) {
-        mounted = true;
-        mountedSpeed = speed;
-        successfulMap = pinMaps[m].label;
-        break;
-      }
-      SD.end();
-      delay(30);
-    }
-
-    if (mounted) break;
+    SD.end();
+    delay(30);
   }
 
   if (!mounted) {
