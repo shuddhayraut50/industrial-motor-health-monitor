@@ -47,7 +47,7 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.5.2-store-first";
+const char *FIRMWARE_VERSION = "1.5.3-store-first-hw";
 
 // Timing & Cadence Constants
 constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
@@ -1375,8 +1375,7 @@ void removeRecordFromQueue(const String &recordId) {
       SD.remove(filename.c_str());
       if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
     }
-  }
-  if (littleFsReady) {
+  } else if (littleFsReady) {
     String filename = String("/lfs_queue/rec_") + recordId + ".json";
     if (LittleFS.exists(filename.c_str())) {
       LittleFS.remove(filename.c_str());
@@ -2147,8 +2146,13 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
 #else
-  DynamicJsonDocument doc(1536);
+  DynamicJsonDocument doc(2560);
 #endif
+
+  // Refresh real-time heap performance metrics right before packet assembly
+  perfMetrics.currentFreeHeapBytes = ESP.getFreeHeap();
+  perfMetrics.minFreeHeapBytes = ESP.getMinFreeHeap();
+  perfMetrics.largestFreeHeapBlockBytes = ESP.getMaxAllocHeap();
 
   doc["device_id"] = DEVICE_ID;
   doc["record_id"] = recordId;
@@ -2193,7 +2197,12 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   doc["condition_status"] = snap.conditionStatus;
   doc["condition_reason"] = snap.conditionReason;
 
-  // Storage Diagnostics
+  // Storage Diagnostics & Pipeline Capacities
+  uint64_t sdTotal = sdCardReady ? SD.totalBytes() : 0;
+  uint64_t sdUsed = sdCardReady ? SD.usedBytes() : 0;
+  uint32_t lfsTotal = littleFsReady ? LittleFS.totalBytes() : 0;
+  uint32_t lfsUsed = littleFsReady ? LittleFS.usedBytes() : 0;
+
   doc["storage_medium"] = storageMedium;
   doc["storage_used_pct"] = storageUsedPct;
   doc["dropped_records_count"] = droppedRecordsCount;
@@ -2201,6 +2210,25 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   doc["unsynced_records_count"] = unsyncedRecordsCount;
   doc["rtc_status"] = rtcStatus;
   doc["rtc_synced"] = rtcSynced;
+  doc["sd_total_bytes"] = (double)sdTotal;
+  doc["sd_used_bytes"] = (double)sdUsed;
+  doc["flash_total_bytes"] = lfsTotal;
+  doc["flash_used_bytes"] = lfsUsed;
+
+  // Hardware Performance & Bottleneck Diagnostics
+  doc["free_heap_bytes"] = perfMetrics.currentFreeHeapBytes;
+  doc["min_free_heap_bytes"] = perfMetrics.minFreeHeapBytes;
+  doc["largest_free_block_bytes"] = perfMetrics.largestFreeHeapBlockBytes;
+  doc["core0_stack_free_bytes"] = (uint32_t)perfMetrics.realtimeTaskStackWatermark;
+  doc["sample_exec_us"] = perfMetrics.sampleExecDurationUs;
+  doc["fast_rms_eval_us"] = perfMetrics.fastRmsCalcDurationUs;
+  doc["decision_to_led_us"] = perfMetrics.conditionToLedLatencyUs;
+  doc["sd_write_time_ms"] = perfMetrics.lastSdWriteDurationMs;
+  doc["upload_time_ms"] = perfMetrics.lastUploadDurationMs;
+  doc["queue_overflow_count"] = perfMetrics.queueOverflowCount;
+  doc["reset_reason"] = perfMetrics.resetReasonStr;
+  doc["wifi_disconnect_count"] = perfMetrics.wifiDisconnectCount;
+  doc["uptime_seconds"] = (uint32_t)(millis() / 1000);
 
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonObject sensorStatus = doc["sensor_status"].to<JsonObject>();
@@ -2213,6 +2241,30 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   sensorStatus["adxl345"] = adxlStat;
   sensorStatus["motor_temp"] = motorStat;
   sensorStatus["ambient_temp"] = ambStat;
+
+  // Embedded Hardware Diagnostics inside sensor_status for 100% schema-safe Postgres JSONB storage
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonObject hw = sensorStatus["esp32_hw"].to<JsonObject>();
+#else
+  JsonObject hw = sensorStatus.createNestedObject("esp32_hw");
+#endif
+  hw["free_heap"] = perfMetrics.currentFreeHeapBytes;
+  hw["min_free_heap"] = perfMetrics.minFreeHeapBytes;
+  hw["largest_block"] = perfMetrics.largestFreeHeapBlockBytes;
+  hw["core0_stack_free"] = (uint32_t)perfMetrics.realtimeTaskStackWatermark;
+  hw["sample_exec_us"] = perfMetrics.sampleExecDurationUs;
+  hw["fast_rms_eval_us"] = perfMetrics.fastRmsCalcDurationUs;
+  hw["decision_to_led_us"] = perfMetrics.conditionToLedLatencyUs;
+  hw["sd_write_time_ms"] = perfMetrics.lastSdWriteDurationMs;
+  hw["upload_time_ms"] = perfMetrics.lastUploadDurationMs;
+  hw["queue_overflow_count"] = perfMetrics.queueOverflowCount;
+  hw["reset_reason"] = perfMetrics.resetReasonStr;
+  hw["wifi_disconnect_count"] = perfMetrics.wifiDisconnectCount;
+  hw["uptime_seconds"] = (uint32_t)(millis() / 1000);
+  hw["sd_total_bytes"] = (double)sdTotal;
+  hw["sd_used_bytes"] = (double)sdUsed;
+  hw["flash_total_bytes"] = lfsTotal;
+  hw["flash_used_bytes"] = lfsUsed;
 
   String payload;
   serializeJson(doc, payload);
@@ -2311,6 +2363,19 @@ void setup() {
 
   // 4. Initialise Storage Hierarchy
   initialiseSDCard(true);
+  if (!littleFsReady) {
+    if (LittleFS.begin(true)) {
+      littleFsReady = true;
+      if (!LittleFS.exists("/lfs_queue")) LittleFS.mkdir("/lfs_queue");
+      if (!LittleFS.exists("/lfs_telemetry.csv")) {
+        File logHeader = LittleFS.open("/lfs_telemetry.csv", FILE_WRITE);
+        if (logHeader) {
+          logHeader.println("record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced");
+          logHeader.close();
+        }
+      }
+    }
+  }
 
   // 5. Initialise OneWire Temperature Probes
   discoverTemperatureProbes(true);

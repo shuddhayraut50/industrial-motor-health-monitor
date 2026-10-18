@@ -42,6 +42,24 @@ export interface TelemetryPayload {
   storage_medium?: StorageMedium | null;
   storage_used_pct?: number | null;
   dropped_records_count?: number | null;
+  // Extended hardware performance & storage bytes
+  free_heap_bytes?: number | null;
+  min_free_heap_bytes?: number | null;
+  largest_free_block_bytes?: number | null;
+  core0_stack_free_bytes?: number | null;
+  sample_exec_us?: number | null;
+  fast_rms_eval_us?: number | null;
+  decision_to_led_us?: number | null;
+  sd_write_time_ms?: number | null;
+  upload_time_ms?: number | null;
+  queue_overflow_count?: number | null;
+  reset_reason?: string | null;
+  wifi_disconnect_count?: number | null;
+  uptime_seconds?: number | null;
+  sd_total_bytes?: number | null;
+  sd_used_bytes?: number | null;
+  flash_total_bytes?: number | null;
+  flash_used_bytes?: number | null;
 }
 
 export interface TelemetryRecord extends TelemetryPayload {
@@ -68,6 +86,23 @@ export interface DeviceRecord {
   storage_medium?: StorageMedium | null;
   storage_used_pct?: number | null;
   dropped_records_count?: number | null;
+  free_heap_bytes?: number | null;
+  min_free_heap_bytes?: number | null;
+  largest_free_block_bytes?: number | null;
+  core0_stack_free_bytes?: number | null;
+  sample_exec_us?: number | null;
+  fast_rms_eval_us?: number | null;
+  decision_to_led_us?: number | null;
+  sd_write_time_ms?: number | null;
+  upload_time_ms?: number | null;
+  queue_overflow_count?: number | null;
+  reset_reason?: string | null;
+  wifi_disconnect_count?: number | null;
+  uptime_seconds?: number | null;
+  sd_total_bytes?: number | null;
+  sd_used_bytes?: number | null;
+  flash_total_bytes?: number | null;
+  flash_used_bytes?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -82,4 +117,36 @@ export interface TelemetryStats {
   rms_x: { min: number; max: number; avg: number };
   rms_y: { min: number; max: number; avg: number };
   rms_z: { min: number; max: number; avg: number };
+}
+
+export interface StoragePipelineDiagnostics {
+  medium?: StorageMedium;
+  used_pct?: number;
+  dropped_records_count?: number;
+  sd_card_status?: SdCardState;
+  unsynced_records_count?: number;
+  oldest_unsynced_timestamp?: string | null;
+  total_supabase_records?: number;
+  sd_total_bytes?: number | null;
+  sd_used_bytes?: number | null;
+  sd_free_bytes?: number | null;
+  flash_total_bytes?: number | null;
+  flash_used_bytes?: number | null;
+  flash_free_bytes?: number | null;
+}
+
+export interface SystemPerformanceDiagnostics {
+  free_heap_bytes?: number | null;
+  min_free_heap_bytes?: number | null;
+  largest_free_block_bytes?: number | null;
+  core0_stack_free_bytes?: number | null;
+  sample_exec_us?: number | null;
+  fast_rms_eval_us?: number | null;
+  decision_to_led_us?: number | null;
+  sd_write_time_ms?: number | null;
+  upload_time_ms?: number | null;
+  queue_overflow_count?: number | null;
+  reset_reason?: string | null;
+  wifi_disconnect_count?: number | null;
+  uptime_seconds?: number | null;
 }

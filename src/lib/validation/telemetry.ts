@@ -102,6 +102,7 @@ export const TelemetryPayloadSchema = z.object({
       motor_temp: z.enum(['ready', 'not_detected', 'error', 'no_data']).optional(),
       ambient_temp: z.enum(['ready', 'not_detected', 'error', 'no_data']).optional(),
     })
+    .passthrough()
     .nullable()
     .optional(),
 
@@ -198,7 +199,26 @@ export const TelemetryPayloadSchema = z.object({
     .max(10000000)
     .nullable()
     .optional(),
-});
+
+  // Extended hardware performance, memory & timing diagnostics
+  free_heap_bytes: z.number().int().min(0).nullable().optional(),
+  min_free_heap_bytes: z.number().int().min(0).nullable().optional(),
+  largest_free_block_bytes: z.number().int().min(0).nullable().optional(),
+  core0_stack_free_bytes: z.number().int().min(0).nullable().optional(),
+  sample_exec_us: z.number().int().min(0).nullable().optional(),
+  fast_rms_eval_us: z.number().int().min(0).nullable().optional(),
+  decision_to_led_us: z.number().int().min(0).nullable().optional(),
+  sd_write_time_ms: z.number().int().min(0).nullable().optional(),
+  upload_time_ms: z.number().int().min(0).nullable().optional(),
+  queue_overflow_count: z.number().int().min(0).nullable().optional(),
+  reset_reason: z.string().max(64).nullable().optional(),
+  wifi_disconnect_count: z.number().int().min(0).nullable().optional(),
+  uptime_seconds: z.number().int().min(0).nullable().optional(),
+  sd_total_bytes: z.number().min(0).nullable().optional(),
+  sd_used_bytes: z.number().min(0).nullable().optional(),
+  flash_total_bytes: z.number().min(0).nullable().optional(),
+  flash_used_bytes: z.number().min(0).nullable().optional(),
+}).passthrough();
 
 export type ValidatedTelemetryPayload = z.infer<typeof TelemetryPayloadSchema>;
 

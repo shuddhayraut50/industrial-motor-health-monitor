@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getLiveTelemetry, getDevice, getDeviceConfig, calculateDeviceConnectionStatus } from '@/lib/supabase/db';
+import { getLiveTelemetry, getDevice, getDeviceConfig, calculateDeviceConnectionStatus, getTotalTelemetryCount } from '@/lib/supabase/db';
 
 export async function GET(request: NextRequest) {
   try {
@@ -7,10 +7,11 @@ export async function GET(request: NextRequest) {
     const deviceId = searchParams.get('device_id') || 'motor-monitor-001';
     const windowSeconds = parseInt(searchParams.get('window') || '300', 10); // default 5 min
 
-    const [device, records, config] = await Promise.all([
+    const [device, records, config, totalSupabaseRecords] = await Promise.all([
       getDevice(deviceId),
       getLiveTelemetry(deviceId, windowSeconds),
       getDeviceConfig(deviceId),
+      getTotalTelemetryCount(deviceId),
     ]);
 
     const latest = records.length > 0 ? records[records.length - 1] : null;
@@ -51,7 +52,31 @@ export async function GET(request: NextRequest) {
     const conditionStatus = latest?.condition_status ?? device?.condition_status ?? 'UNKNOWN';
     const conditionReason = latest?.condition_reason ?? device?.condition_reason ?? 'Initial observation or unconfigured';
 
-    // Storage hierarchy diagnostics
+    // Hardware diagnostics & bottleneck metrics extraction
+    const esp32Hw = ((latest?.sensor_status as Record<string, unknown>)?.esp32_hw || {}) as Record<string, unknown>;
+
+    const systemPerformance = {
+      free_heap_bytes: latest?.free_heap_bytes ?? (esp32Hw.free_heap as number | undefined) ?? null,
+      min_free_heap_bytes: latest?.min_free_heap_bytes ?? (esp32Hw.min_free_heap as number | undefined) ?? null,
+      largest_free_block_bytes: latest?.largest_free_block_bytes ?? (esp32Hw.largest_block as number | undefined) ?? null,
+      core0_stack_free_bytes: latest?.core0_stack_free_bytes ?? (esp32Hw.core0_stack_free as number | undefined) ?? null,
+      sample_exec_us: latest?.sample_exec_us ?? (esp32Hw.sample_exec_us as number | undefined) ?? null,
+      fast_rms_eval_us: latest?.fast_rms_eval_us ?? (esp32Hw.fast_rms_eval_us as number | undefined) ?? null,
+      decision_to_led_us: latest?.decision_to_led_us ?? (esp32Hw.decision_to_led_us as number | undefined) ?? null,
+      sd_write_time_ms: latest?.sd_write_time_ms ?? (esp32Hw.sd_write_time_ms as number | undefined) ?? null,
+      upload_time_ms: latest?.upload_time_ms ?? (esp32Hw.upload_time_ms as number | undefined) ?? null,
+      queue_overflow_count: latest?.queue_overflow_count ?? (esp32Hw.queue_overflow_count as number | undefined) ?? 0,
+      reset_reason: latest?.reset_reason ?? (esp32Hw.reset_reason as string | undefined) ?? 'UNKNOWN',
+      wifi_disconnect_count: latest?.wifi_disconnect_count ?? (esp32Hw.wifi_disconnect_count as number | undefined) ?? 0,
+      uptime_seconds: latest?.uptime_seconds ?? (esp32Hw.uptime_seconds as number | undefined) ?? null,
+    };
+
+    // Storage hierarchy & capacity diagnostics
+    const sdTotalBytes = latest?.sd_total_bytes ?? (esp32Hw.sd_total_bytes as number | undefined) ?? null;
+    const sdUsedBytes = latest?.sd_used_bytes ?? (esp32Hw.sd_used_bytes as number | undefined) ?? null;
+    const flashTotalBytes = latest?.flash_total_bytes ?? (esp32Hw.flash_total_bytes as number | undefined) ?? null;
+    const flashUsedBytes = latest?.flash_used_bytes ?? (esp32Hw.flash_used_bytes as number | undefined) ?? null;
+
     const storageDiagnostics = {
       medium: latest?.storage_medium ?? device?.storage_medium ?? (latest?.sd_card_status === 'ready' ? 'sd_card' : 'none'),
       used_pct: latest?.storage_used_pct ?? device?.storage_used_pct ?? 0,
@@ -59,6 +84,17 @@ export async function GET(request: NextRequest) {
       sd_card_status: latest?.sd_card_status ?? device?.sd_card_status ?? 'not_initialized',
       unsynced_records_count: latest?.unsynced_records_count ?? device?.unsynced_records_count ?? 0,
       oldest_unsynced_timestamp: latest?.oldest_unsynced_timestamp ?? null,
+      total_supabase_records: totalSupabaseRecords,
+      sd_total_bytes: sdTotalBytes,
+      sd_used_bytes: sdUsedBytes,
+      sd_free_bytes: (sdTotalBytes !== null && sdUsedBytes !== null && sdTotalBytes !== undefined && sdUsedBytes !== undefined)
+        ? Math.max(0, sdTotalBytes - sdUsedBytes)
+        : null,
+      flash_total_bytes: flashTotalBytes,
+      flash_used_bytes: flashUsedBytes,
+      flash_free_bytes: (flashTotalBytes !== null && flashUsedBytes !== null && flashTotalBytes !== undefined && flashUsedBytes !== undefined)
+        ? Math.max(0, flashTotalBytes - flashUsedBytes)
+        : null,
     };
 
     // Validate RSSI: Standard 2.4GHz Wi-Fi RSSI is between -100 and -15 dBm.
@@ -118,6 +154,7 @@ export async function GET(request: NextRequest) {
         condition_status: conditionStatus,
         condition_reason: conditionReason,
         storage_diagnostics: storageDiagnostics,
+        system_performance: systemPerformance,
         sensor_health: sensorHealth,
         last_successful_telemetry: latest?.recorded_at ?? device?.last_seen_at ?? null,
         last_measured_at: latest?.measured_at ?? device?.last_measured_at ?? null,

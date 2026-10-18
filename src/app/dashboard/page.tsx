@@ -18,13 +18,48 @@ import {
   Activity,
   HardDrive,
   Database,
+  Zap,
+  Server,
+  Layers,
+  Timer,
+  CheckCircle2,
 } from 'lucide-react';
 import Link from 'next/link';
-import { TelemetryRecord, DeviceRecord, SensorState, SdCardState, RtcState, ConditionStatus, StorageMedium } from '@/lib/types/telemetry';
+import {
+  TelemetryRecord,
+  DeviceRecord,
+  SensorState,
+  SdCardState,
+  RtcState,
+  ConditionStatus,
+  StorageMedium,
+  StoragePipelineDiagnostics,
+  SystemPerformanceDiagnostics,
+} from '@/lib/types/telemetry';
 import { calculateSignedThermalRise } from '@/lib/utils/temperature';
 import { SimpleMotorView } from '@/components/dashboard/SimpleMotorView';
 import { LedCommandCenter } from '@/components/dashboard/LedCommandCenter';
 import { DeviceEventsHistory } from '@/components/dashboard/DeviceEventsHistory';
+
+function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || isNaN(bytes)) return 'N/A';
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
+}
+
+function formatUptime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || isNaN(seconds)) return 'N/A';
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
 
 export default function DashboardPage() {
   const [deviceId, setDeviceId] = useState(() => {
@@ -72,6 +107,8 @@ export default function DashboardPage() {
   const [storageMedium, setStorageMedium] = useState<StorageMedium>('none');
   const [storageUsedPct, setStorageUsedPct] = useState<number>(0);
   const [droppedRecordsCount, setDroppedRecordsCount] = useState<number>(0);
+  const [storageDiagnostics, setStorageDiagnostics] = useState<StoragePipelineDiagnostics | null>(null);
+  const [systemPerformance, setSystemPerformance] = useState<SystemPerformanceDiagnostics | null>(null);
   const [sensorHealth, setSensorHealth] = useState<{
     esp32: 'online' | 'stale' | 'offline';
     wifi: { status: 'connected' | 'offline'; rssi_dbm: number | null };
@@ -101,14 +138,8 @@ export default function DashboardPage() {
     config_version: number;
     condition_status?: ConditionStatus | null;
     condition_reason?: string | null;
-    storage_diagnostics?: {
-      medium?: StorageMedium;
-      used_pct?: number;
-      dropped_records_count?: number;
-      sd_card_status?: SdCardState;
-      unsynced_records_count?: number;
-      oldest_unsynced_timestamp?: string | null;
-    };
+    storage_diagnostics?: StoragePipelineDiagnostics;
+    system_performance?: SystemPerformanceDiagnostics;
     sensor_health?: {
       esp32: 'online' | 'stale' | 'offline';
       wifi: { status: 'connected' | 'offline'; rssi_dbm: number | null };
@@ -137,6 +168,8 @@ export default function DashboardPage() {
     setStorageMedium(data.storage_diagnostics?.medium || data.latest?.storage_medium || data.device?.storage_medium || 'none');
     setStorageUsedPct(data.storage_diagnostics?.used_pct ?? data.latest?.storage_used_pct ?? data.device?.storage_used_pct ?? 0);
     setDroppedRecordsCount(data.storage_diagnostics?.dropped_records_count ?? data.latest?.dropped_records_count ?? data.device?.dropped_records_count ?? 0);
+    setStorageDiagnostics(data.storage_diagnostics || null);
+    setSystemPerformance(data.system_performance || null);
 
     if (data.sensor_health) {
       setSensorHealth(data.sensor_health);
@@ -956,10 +989,376 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Section 5: Interactive Two-Way Command & LED Diagnostics */}
+        {/* Section 5: Storage Hierarchy & Cloud Pipeline Capacity */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <HardDrive className="w-4 h-4 text-amber-400" />
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                Storage Hierarchy & Cloud Pipeline Capacity
+              </h2>
+            </div>
+            <span className="text-xs text-slate-500 font-mono">Store-First Local & Cloud Sync</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {/* 1. MicroSD Storage */}
+            <Card className="p-4 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+                  MicroSD Card (Master)
+                </span>
+                <Badge variant={sdCardState === 'ready' ? 'online' : 'offline'} dot>
+                  {sdCardState === 'ready' ? 'Ready' : 'Missing'}
+                </Badge>
+              </div>
+              <div className="space-y-1 mb-3">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-2xl font-bold font-mono text-slate-100">
+                    {formatBytes(storageDiagnostics?.sd_total_bytes)}
+                  </span>
+                  <span className="text-xs font-mono text-slate-400">
+                    {storageUsedPct.toFixed(2)}% used
+                  </span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-amber-400 h-full rounded-full transition-all duration-500"
+                    style={{ width: `${Math.min(100, Math.max(storageUsedPct, 2))}%` }}
+                  />
+                </div>
+              </div>
+              <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
+                <div className="flex justify-between">
+                  <span>Used Space:</span>
+                  <span className="text-slate-200">{formatBytes(storageDiagnostics?.sd_used_bytes)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Free Space:</span>
+                  <span className="text-emerald-400 font-semibold">{formatBytes(storageDiagnostics?.sd_free_bytes)}</span>
+                </div>
+                <div className="text-[10px] text-amber-400/90 pt-1 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 shrink-0" />
+                  <span>Physical Eject Safe (/telemetry.csv)</span>
+                </div>
+              </div>
+            </Card>
+
+            {/* 2. Flash Fallback (LittleFS) */}
+            <Card className="p-4 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Database className="w-3.5 h-3.5 text-cyan-400" />
+                  ESP32 Flash (LittleFS)
+                </span>
+                <Badge variant={storageMedium === 'flash_littlefs' ? 'warning' : 'neutral'}>
+                  {storageMedium === 'flash_littlefs' ? 'Active Fallback' : 'Standby Buffer'}
+                </Badge>
+              </div>
+              <div className="space-y-1 mb-3">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-2xl font-bold font-mono text-slate-100">
+                    {formatBytes(storageDiagnostics?.flash_total_bytes)}
+                  </span>
+                  <span className="text-xs font-mono text-slate-400">
+                    90% Safety Limit
+                  </span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-cyan-400 h-full rounded-full transition-all duration-500"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        storageDiagnostics?.flash_total_bytes
+                          ? ((storageDiagnostics.flash_used_bytes || 0) / storageDiagnostics.flash_total_bytes) * 100
+                          : 2
+                      )}%`,
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
+                <div className="flex justify-between">
+                  <span>Used Space:</span>
+                  <span className="text-slate-200">{formatBytes(storageDiagnostics?.flash_used_bytes)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Free Buffer:</span>
+                  <span className="text-cyan-400 font-semibold">{formatBytes(storageDiagnostics?.flash_free_bytes)}</span>
+                </div>
+                <div className="text-[10px] text-slate-500 pt-1">
+                  Strict 90% flash guard protects system SPI boot sector
+                </div>
+              </div>
+            </Card>
+
+            {/* 3. Pending Upload Backlog */}
+            <Card className="p-4 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                  Pending Upload Queue
+                </span>
+                <Badge variant={unsyncedCount > 0 ? 'warning' : 'online'} dot>
+                  {unsyncedCount > 0 ? `${unsyncedCount} Backlog` : 'All Synced'}
+                </Badge>
+              </div>
+              <div className="space-y-1 mb-3">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-2xl font-bold font-mono text-slate-100">
+                    {unsyncedCount}
+                  </span>
+                  <span className="text-xs font-mono text-slate-400">
+                    pending records
+                  </span>
+                </div>
+                <div className="text-xs text-slate-400">
+                  {unsyncedCount === 0
+                    ? 'Durability queue clean; no pending uploads.'
+                    : `Oldest: ${storageDiagnostics?.oldest_unsynced_timestamp ? new Date(storageDiagnostics.oldest_unsynced_timestamp).toLocaleTimeString() : 'In transit'}`}
+                </div>
+              </div>
+              <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
+                <div className="flex justify-between">
+                  <span>Drain Thread:</span>
+                  <span className="text-slate-200">Core 1 Async Background</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Dropped Packets:</span>
+                  <span className={droppedRecordsCount > 0 ? "text-rose-400 font-bold" : "text-emerald-400"}>
+                    {droppedRecordsCount}
+                  </span>
+                </div>
+                <div className="text-[10px] text-slate-500 pt-1">
+                  Non-volatile fallback stores records across power cycles
+                </div>
+              </div>
+            </Card>
+
+            {/* 4. Supabase Cloud Database */}
+            <Card className="p-4 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Server className="w-3.5 h-3.5 text-emerald-400" />
+                  Supabase Cloud Database
+                </span>
+                <Badge variant={isOnline ? 'online' : 'stale'} dot>
+                  {isOnline ? 'Active Ingest' : 'Awaiting Ingest'}
+                </Badge>
+              </div>
+              <div className="space-y-1 mb-3">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-2xl font-bold font-mono text-slate-100">
+                    {storageDiagnostics?.total_supabase_records !== undefined
+                      ? storageDiagnostics.total_supabase_records.toLocaleString()
+                      : '--'}
+                  </span>
+                  <span className="text-xs font-mono text-slate-400">
+                    rows saved
+                  </span>
+                </div>
+                <div className="text-xs text-slate-400">
+                  Target: 5-Day Continuous Reliability Testing
+                </div>
+              </div>
+              <div className="text-[11px] font-mono text-slate-400 space-y-1 border-t border-slate-800/80 pt-2">
+                <div className="flex justify-between">
+                  <span>Table:</span>
+                  <span className="text-slate-200">public.telemetry</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Data Path:</span>
+                  <span className="text-emerald-400">Direct HTTPS Ingest</span>
+                </div>
+                <div className="text-[10px] text-slate-500 pt-1">
+                  PostgreSQL with JSONB indexed sensor health telemetry
+                </div>
+              </div>
+            </Card>
+          </div>
+        </div>
+
+        {/* Section 6: ESP32 Hardware Benchmarks & Bottleneck Analysis */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="w-4 h-4 text-cyan-400" />
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                ESP32 Hardware Benchmarks & Bottleneck Analysis
+              </h2>
+            </div>
+            <span className="text-xs text-slate-500 font-mono">Microsecond Timing & Memory Diagnostics</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
+            {/* 1. Storage Write Latency */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Storage Write
+                </span>
+                <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-xl font-bold font-mono text-slate-100">
+                  {systemPerformance?.sd_write_time_ms !== null && systemPerformance?.sd_write_time_ms !== undefined
+                    ? `${systemPerformance.sd_write_time_ms} ms`
+                    : '--'}
+                </div>
+                <span className={`text-[10px] font-mono font-semibold ${
+                  (systemPerformance?.sd_write_time_ms ?? 0) < 50
+                    ? 'text-emerald-400'
+                    : (systemPerformance?.sd_write_time_ms ?? 0) < 120
+                    ? 'text-amber-400'
+                    : 'text-rose-400'
+                }`}>
+                  {(systemPerformance?.sd_write_time_ms ?? 0) < 50
+                    ? 'Optimal (<50ms)'
+                    : (systemPerformance?.sd_write_time_ms ?? 0) < 120
+                    ? 'Moderate SPI load'
+                    : 'Storage Bottleneck'}
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                FAT32 flush latency
+              </span>
+            </Card>
+
+            {/* 2. HTTPS Upload Latency */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Upload Duration
+                </span>
+                <Wifi className="w-3.5 h-3.5 text-sky-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-xl font-bold font-mono text-slate-100">
+                  {systemPerformance?.upload_time_ms !== null && systemPerformance?.upload_time_ms !== undefined
+                    ? `${systemPerformance.upload_time_ms} ms`
+                    : '--'}
+                </div>
+                <span className={`text-[10px] font-mono font-semibold ${
+                  (systemPerformance?.upload_time_ms ?? 0) < 2500
+                    ? 'text-emerald-400'
+                    : (systemPerformance?.upload_time_ms ?? 0) < 4000
+                    ? 'text-amber-400'
+                    : 'text-rose-400'
+                }`}>
+                  {(systemPerformance?.upload_time_ms ?? 0) < 2500
+                    ? 'Normal TLS handshake'
+                    : (systemPerformance?.upload_time_ms ?? 0) < 4000
+                    ? 'Elevated network delay'
+                    : 'Network Bottleneck'}
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                Vercel TLS 1.2 POST
+              </span>
+            </Card>
+
+            {/* 3. 200 Hz Sampling Execution */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Sample Exec Slot
+                </span>
+                <Timer className="w-3.5 h-3.5 text-emerald-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-xl font-bold font-mono text-slate-100">
+                  {systemPerformance?.sample_exec_us !== null && systemPerformance?.sample_exec_us !== undefined
+                    ? `${systemPerformance.sample_exec_us} µs`
+                    : '--'}
+                </div>
+                <span className="text-[10px] font-mono text-emerald-400 font-semibold">
+                  Budget: 5,000 µs (200Hz)
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                ~{systemPerformance?.sample_exec_us ? ((systemPerformance.sample_exec_us / 5000) * 100).toFixed(1) : '9'}% Core 0 Load
+              </span>
+            </Card>
+
+            {/* 4. Real-Time Stack & Queue */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Core 0 Headroom
+                </span>
+                <Cpu className="w-3.5 h-3.5 text-cyan-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-xl font-bold font-mono text-slate-100">
+                  {systemPerformance?.core0_stack_free_bytes !== null && systemPerformance?.core0_stack_free_bytes !== undefined
+                    ? `${systemPerformance.core0_stack_free_bytes} B`
+                    : '--'}
+                </div>
+                <span className="text-[10px] font-mono text-emerald-400 font-semibold">
+                  Stack Watermark Free
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                Overflows: {systemPerformance?.queue_overflow_count ?? 0}
+              </span>
+            </Card>
+
+            {/* 5. Memory & Fragmentation */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Free Heap / Min
+                </span>
+                <Activity className="w-3.5 h-3.5 text-indigo-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-xl font-bold font-mono text-slate-100">
+                  {formatBytes(systemPerformance?.free_heap_bytes)}
+                </div>
+                <span className="text-[10px] font-mono text-slate-400">
+                  Min: {formatBytes(systemPerformance?.min_free_heap_bytes)}
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                Max Alloc: {formatBytes(systemPerformance?.largest_free_block_bytes)}
+              </span>
+            </Card>
+
+            {/* 6. Power Stability & Uptime */}
+            <Card className="p-3 flex flex-col justify-between border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                  Reset & Uptime
+                </span>
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+              </div>
+              <div className="my-1.5">
+                <div className="text-base font-bold font-mono text-slate-100 truncate">
+                  {systemPerformance?.reset_reason || 'UNKNOWN'}
+                </div>
+                <span className={`text-[10px] font-mono font-semibold ${
+                  systemPerformance?.reset_reason === 'BROWNOUT'
+                    ? 'text-rose-400'
+                    : 'text-emerald-400'
+                }`}>
+                  {systemPerformance?.reset_reason === 'BROWNOUT'
+                    ? 'BROWNOUT DETECTED'
+                    : 'Clean Power Supply'}
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">
+                Uptime: {formatUptime(systemPerformance?.uptime_seconds)}
+              </span>
+            </Card>
+          </div>
+        </div>
+
+        {/* Section 7: Interactive Two-Way Command & LED Diagnostics */}
         <LedCommandCenter deviceId={deviceId} isOnline={isOnline} />
 
-        {/* Section 6: Device Diagnostics & Component Event History */}
+        {/* Section 8: Device Diagnostics & Component Event History */}
         <DeviceEventsHistory
           deviceId={deviceId}
           isOnline={isOnline}

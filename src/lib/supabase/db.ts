@@ -545,6 +545,34 @@ export async function getLiveTelemetry(
   return mockRecords.sort(sortByTime);
 }
 
+/**
+ * Fast exact count of telemetry rows stored in Supabase table.
+ * Uses PostgREST HEAD request ({ count: 'exact', head: true }) so zero row data is transferred.
+ */
+export async function getTotalTelemetryCount(deviceId?: string): Promise<number> {
+  const admin = getAdminClient();
+  if (admin) {
+    try {
+      let query = admin.from('telemetry').select('*', { count: 'exact', head: true });
+      if (deviceId) {
+        query = query.eq('device_id', deviceId);
+      }
+      const { count, error } = await query;
+      if (!error && count !== null) {
+        return count;
+      }
+    } catch (err) {
+      console.warn('[TOTAL_COUNT_ERROR]', err);
+    }
+  }
+
+  // Fallback for mock store
+  if (deviceId) {
+    return mockDb.telemetry.filter((t) => t.device_id === deviceId).length;
+  }
+  return mockDb.telemetry.length;
+}
+
 export async function getHistoricalTelemetry(
   deviceId: string,
   startDate?: string,
