@@ -62,6 +62,15 @@ constexpr float ERROR_DIAGNOSTICS_BUDGET_PCT = 15.0f;    // 15% dedicated to err
 constexpr float TELEMETRY_BACKLOG_BUDGET_PCT = 85.0f;    // 85% of active storage dedicated to telemetry queue
 constexpr float STORAGE_CEILING_LIMIT_PCT = 90.0f;       // Backward compatibility alias
 
+// Forward Declarations for Arduino Preprocessor
+struct TelemetrySnapshot;
+struct AlertThresholds;
+struct DiagnosticStateTracker;
+struct PerformanceMetrics;
+struct RollingWindowAccumulator;
+struct FiveSecAccumulator;
+struct PendingCommandAck;
+
 // ADXL345 Registers & Constants
 constexpr uint8_t REG_DEVID = 0x00;
 constexpr uint8_t REG_BW_RATE = 0x2C;
