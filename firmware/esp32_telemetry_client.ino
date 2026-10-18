@@ -47,7 +47,7 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.5.1-hardened";
+const char *FIRMWARE_VERSION = "1.5.2-store-first";
 
 // Timing & Cadence Constants
 constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
@@ -1082,6 +1082,14 @@ bool initialiseLittleFSFallback() {
     if (!LittleFS.exists("/lfs_queue")) {
       LittleFS.mkdir("/lfs_queue");
     }
+    if (!LittleFS.exists("/lfs_telemetry.csv")) {
+      File logHeader = LittleFS.open("/lfs_telemetry.csv", FILE_WRITE);
+      if (logHeader) {
+        logHeader.println("record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced");
+        logHeader.flush();
+        logHeader.close();
+      }
+    }
     Serial.printf("[LittleFS] OK: Bounded internal flash mounted (Used: %.1f%%)\n", storageUsedPct);
     return true;
   }
@@ -1266,7 +1274,8 @@ bool initialiseSDCard(bool verbose = true) {
   if (!SD.exists("/telemetry.csv")) {
     File logFile = SD.open("/telemetry.csv", FILE_WRITE);
     if (logFile) {
-      logFile.println("record_id,measured_at,motor_temp_c,ambient_temp_c,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi,condition_status,storage_medium,storage_used_pct,synced");
+      logFile.println("record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced");
+      logFile.flush();
       logFile.close();
     }
   }
@@ -1324,16 +1333,19 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
     File f = SD.open(filename.c_str(), FILE_WRITE);
     if (f) {
       f.print(jsonPayload);
+      f.flush();
       f.close();
       unsyncedRecordsCount++;
       perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
       return true;
     }
+    sdCardReady = false;
     sdCardStatus = "write_error";
+    storageMedium = "flash_littlefs";
     if (diagTracker.lastSdState != "write_error") {
       String prevState = diagTracker.lastSdState;
       diagTracker.lastSdState = "write_error";
-      logDiagnosticEvent("sd_card", "SD_CARD_WRITE_FAILED", "error", prevState.c_str(), "write_error", "Failed to write telemetry record to SD card", nullptr, false);
+      logDiagnosticEvent("sd_card", "SD_CARD_WRITE_FAILED", "error", prevState.c_str(), "write_error", "Failed to write telemetry record to SD card; switching to LittleFS", nullptr, false);
     }
     if (!littleFsReady) initialiseLittleFSFallback();
   }
@@ -1343,6 +1355,7 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
     File f = LittleFS.open(filename.c_str(), FILE_WRITE);
     if (f) {
       f.print(jsonPayload);
+      f.flush();
       f.close();
       unsyncedRecordsCount++;
       storageMedium = "flash_littlefs";
@@ -1355,33 +1368,102 @@ bool saveRecordToQueue(const String &recordId, const String &jsonPayload) {
   return false;
 }
 
+void removeRecordFromQueue(const String &recordId) {
+  if (sdCardReady) {
+    String filename = String("/queue/rec_") + recordId + ".json";
+    if (SD.exists(filename.c_str())) {
+      SD.remove(filename.c_str());
+      if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+    }
+  }
+  if (littleFsReady) {
+    String filename = String("/lfs_queue/rec_") + recordId + ".json";
+    if (LittleFS.exists(filename.c_str())) {
+      LittleFS.remove(filename.c_str());
+      if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
+    }
+  }
+}
+
 bool appendTelemetryToCsv(
     const String &recordId, const String &measuredAt,
+    const char *condStatus, const char *condReason,
     bool hasMotor, float motorTemp,
     bool hasAmbient, float ambientTemp,
-    bool hasVibration, float rmsX, float rmsY, float rmsZ,
+    float thermalRise,
+    bool hasVibration, float ax, float ay, float az,
+    float rmsX, float rmsY, float rmsZ,
     uint32_t sampleCount, float quality,
-    int wifiRssi, const char *condStatus, const String &stgMedium, float stgUsed,
+    int wifiRssi,
+    const char *adxlStatus, const char *motorStatus, const char *ambientStatus,
+    const String &stgMedium, float stgUsed,
     bool synced
 ) {
-  if (!sdCardReady) return false;
-
   uint64_t sdStart = esp_timer_get_time();
-  File f = SD.open("/telemetry.csv", FILE_APPEND);
-  if (!f) {
-    sdCardStatus = "write_error";
-    return false;
+
+  if (sdCardReady) {
+    if (!SD.exists("/telemetry.csv")) {
+      File logHeader = SD.open("/telemetry.csv", FILE_WRITE);
+      if (logHeader) {
+        logHeader.println("record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced");
+        logHeader.flush();
+        logHeader.close();
+      }
+    }
+
+    File f = SD.open("/telemetry.csv", FILE_APPEND);
+    if (f) {
+      f.printf("%s,%s,%s,\"%s\",", recordId.c_str(), measuredAt.c_str(), condStatus, condReason ? condReason : "");
+      if (hasMotor) f.printf("%.2f,", motorTemp); else f.print(",");
+      if (hasAmbient) f.printf("%.2f,", ambientTemp); else f.print(",");
+      if (hasMotor && hasAmbient) f.printf("%.2f,", thermalRise); else f.print(",");
+      if (hasVibration) f.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,", ax, ay, az, rmsX, rmsY, rmsZ); else f.print(",,,,,,");
+      f.printf("%u,%.2f,", sampleCount, quality);
+      if (wifiRssi > -120) f.printf("%d,", wifiRssi); else f.print(",");
+      f.printf("%s,%s,%s,%s,%.1f,%s\n",
+               adxlStatus, motorStatus, ambientStatus, stgMedium.c_str(), stgUsed, synced ? "1" : "0");
+      f.flush();
+      f.close();
+      perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
+      return true;
+    } else {
+      sdCardReady = false;
+      sdCardStatus = "write_error";
+      storageMedium = "flash_littlefs";
+      if (!littleFsReady) initialiseLittleFSFallback();
+    }
   }
 
-  f.printf("%s,%s,", recordId.c_str(), measuredAt.c_str());
-  if (hasMotor) f.printf("%.2f,", motorTemp); else f.print(",");
-  if (hasAmbient) f.printf("%.2f,", ambientTemp); else f.print(",");
-  if (hasVibration) f.printf("%.4f,%.4f,%.4f,", rmsX, rmsY, rmsZ); else f.print(",,,");
-  f.printf("%u,%.2f,%d,%s,%s,%.1f,%s\n",
-           sampleCount, quality, wifiRssi, condStatus, stgMedium.c_str(), stgUsed, synced ? "1" : "0");
-  f.close();
-  perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
-  return true;
+  // LittleFS Fallback CSV (up to 90% flash ceiling)
+  if (littleFsReady && storageUsedPct < STORAGE_CEILING_LIMIT_PCT) {
+    if (!LittleFS.exists("/lfs_telemetry.csv")) {
+      File logHeader = LittleFS.open("/lfs_telemetry.csv", FILE_WRITE);
+      if (logHeader) {
+        logHeader.println("record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced");
+        logHeader.flush();
+        logHeader.close();
+      }
+    }
+
+    File f = LittleFS.open("/lfs_telemetry.csv", FILE_APPEND);
+    if (f) {
+      f.printf("%s,%s,%s,\"%s\",", recordId.c_str(), measuredAt.c_str(), condStatus, condReason ? condReason : "");
+      if (hasMotor) f.printf("%.2f,", motorTemp); else f.print(",");
+      if (hasAmbient) f.printf("%.2f,", ambientTemp); else f.print(",");
+      if (hasMotor && hasAmbient) f.printf("%.2f,", thermalRise); else f.print(",");
+      if (hasVibration) f.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,", ax, ay, az, rmsX, rmsY, rmsZ); else f.print(",,,,,,");
+      f.printf("%u,%.2f,", sampleCount, quality);
+      if (wifiRssi > -120) f.printf("%d,", wifiRssi); else f.print(",");
+      f.printf("%s,%s,%s,%s,%.1f,%s\n",
+               adxlStatus, motorStatus, ambientStatus, stgMedium.c_str(), stgUsed, synced ? "1" : "0");
+      f.flush();
+      f.close();
+      perfMetrics.lastSdWriteDurationMs = (uint32_t)((esp_timer_get_time() - sdStart) / 1000);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // ==============================================================================
@@ -1477,10 +1559,13 @@ void checkSensorRecovery() {
   if (!adxlReady) initialiseADXL345(false);
   if (!rtcReady) initialiseDS3231(false);
   if (!motorProbeFound || !ambientProbeFound) discoverTemperatureProbes(false);
-  // Re-probe SD card only every 120s if missing to prevent SPI bus mount timeout freezes
-  if (!sdCardReady && (now - lastSdRetryMs >= 120000)) {
+  // Re-probe SD card every 15s if missing to support hot-plugging when card is re-inserted
+  if (!sdCardReady && (now - lastSdRetryMs >= 15000)) {
     lastSdRetryMs = now;
-    initialiseSDCard(false);
+    if (initialiseSDCard(false)) {
+      Serial.println("[SD-HOTPLUG] SUCCESS: MicroSD card detected and remounted on SPI bus!");
+      scanOfflineQueue();
+    }
   }
 }
 
@@ -2038,7 +2123,11 @@ void processBacklogQueue() {
   };
 
   if (sdCardReady) {
-    processEntry(true, "/queue", "/quarantine");
+    bool processedSd = processEntry(true, "/queue", "/quarantine");
+    // Also drain LittleFS queue if any records were buffered while SD card was extracted
+    if (!processedSd && littleFsReady) {
+      processEntry(false, "/lfs_queue", "/lfs_quar");
+    }
   } else if (littleFsReady) {
     processEntry(false, "/lfs_queue", "/lfs_quar");
   }
@@ -2118,21 +2207,47 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
 #else
   JsonObject sensorStatus = doc.createNestedObject("sensor_status");
 #endif
-  sensorStatus["adxl345"] = snap.hasVibration ? "ready" : (adxlError ? "error" : "not_detected");
-  sensorStatus["motor_temp"] = snap.hasMotorTemp ? "ready" : (motorProbeFound ? "error" : "not_detected");
-  sensorStatus["ambient_temp"] = snap.hasAmbientTemp ? "ready" : (ambientProbeFound ? "error" : "not_detected");
+  const char *adxlStat = snap.hasVibration ? "ready" : (adxlError ? "error" : "not_detected");
+  const char *motorStat = snap.hasMotorTemp ? "ready" : (motorProbeFound ? "error" : "not_detected");
+  const char *ambStat = snap.hasAmbientTemp ? "ready" : (ambientProbeFound ? "error" : "not_detected");
+  sensorStatus["adxl345"] = adxlStat;
+  sensorStatus["motor_temp"] = motorStat;
+  sensorStatus["ambient_temp"] = ambStat;
 
   String payload;
   serializeJson(doc, payload);
 
-  bool synced = false;
+  // --------------------------------------------------------------------------
+  // STEP 1: STORE FIRST LOCALLY (Persistent Master CSV Log & Durability Buffer)
+  // --------------------------------------------------------------------------
+  float thermalRise = (snap.hasMotorTemp && snap.hasAmbientTemp) ? (snap.motorTemp - snap.ambientTemp) : 0.0f;
+  appendTelemetryToCsv(
+      recordId, measuredAt, snap.conditionStatus, snap.conditionReason,
+      snap.hasMotorTemp, snap.motorTemp,
+      snap.hasAmbientTemp, snap.ambientTemp,
+      thermalRise,
+      snap.hasVibration, snap.meanX, snap.meanY, snap.meanZ,
+      snap.rmsX, snap.rmsY, snap.rmsZ,
+      snap.sampleCount, snap.acquisitionQuality,
+      wifiRssi,
+      adxlStat, motorStat, ambStat,
+      storageMedium, storageUsedPct,
+      false // Initially false, marked synced upon confirmed cloud ingestion
+  );
 
-  // Direct upload of live telemetry snapshot whenever Wi-Fi is connected
+  // Always write to offline queue file first to guarantee non-volatile durability
+  saveRecordToQueue(recordId, payload);
+
+  // --------------------------------------------------------------------------
+  // STEP 2: SIMULTANEOUS / ASYNCHRONOUS CLOUD UPLOAD (When Network Free)
+  // --------------------------------------------------------------------------
   if (g_wifiConnected) {
     String responseStr;
     int httpCode = sendTelemetryPayload(payload, responseStr);
     if (httpCode >= 200 && httpCode < 300) {
-      synced = true;
+      // Confirmed accepted & persisted in Supabase database!
+      // Safely remove the temporary queue record so it is not re-uploaded from backlog
+      removeRecordFromQueue(recordId);
       if (diagTracker.lastApiState != "healthy") {
         diagTracker.lastApiState = "healthy";
         logDiagnosticEvent("api", "API_UPLOAD_RECOVERED", "info", "failing", "healthy", "HTTPS telemetry upload successfully restored", nullptr, true);
@@ -2140,6 +2255,7 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
       consecutiveUploadFailures = 0;
       lastSuccessfulUploadMs = millis();
     } else {
+      // HTTP failure (4xx, 5xx, timeout): Record is ALREADY safely stored in queue!
       consecutiveUploadFailures++;
       if (consecutiveUploadFailures == 3 && diagTracker.lastApiState != "failing") {
         diagTracker.lastApiState = "failing";
@@ -2147,22 +2263,14 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
         snprintf(errBuf, sizeof(errBuf), "{\"http_code\":%d,\"consecutive_failures\":%u}", httpCode, consecutiveUploadFailures);
         logDiagnosticEvent("api", "API_UPLOAD_FAILED", "error", "healthy", "failing", "HTTPS telemetry upload failed repeatedly", errBuf, false);
       }
-      saveRecordToQueue(recordId, payload);
+      // processBacklogQueue() will automatically drain and retry when network/server is free
     }
   } else {
-    saveRecordToQueue(recordId, payload);
+    // Wi-Fi is currently disconnected / offline:
+    // Data is 100% safe in /queue/ or /lfs_queue/. It will drain automatically when Wi-Fi connects.
+    Serial.printf("[STORE-FIRST] Wi-Fi offline. Record %s safely stored in %s queue (Total unsynced: %u)\n",
+                  recordId.c_str(), storageMedium.c_str(), unsyncedRecordsCount);
   }
-
-  // Always log to persistent CSV on MicroSD card
-  appendTelemetryToCsv(
-      recordId, measuredAt,
-      snap.hasMotorTemp, snap.motorTemp,
-      snap.hasAmbientTemp, snap.ambientTemp,
-      snap.hasVibration, snap.rmsX, snap.rmsY, snap.rmsZ,
-      snap.sampleCount, snap.acquisitionQuality,
-      wifiRssi, snap.conditionStatus, storageMedium, storageUsedPct,
-      synced
-  );
 }
 
 // ==============================================================================

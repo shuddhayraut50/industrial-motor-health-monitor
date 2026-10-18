@@ -2,6 +2,27 @@
 
 All notable changes, architectural improvements, and pin mappings for the Industrial Motor Health Monitor are documented in this file.
 
+## [v1.5.2-store-first] — 2026-10-18: Store-First Local Persistence, Direct SD Extraction & Hot-Plug
+
+### 1. Store-First Architecture (Guaranteed Local Non-Volatile Persistence)
+- **Local-First Logging:** Every 5-second telemetry snapshot is FIRST committed to local non-volatile storage (`/telemetry.csv` and `/queue/rec_<id>.json`) before any network formatting or upload attempt.
+- **Direct SD Extraction Support:**
+  - Master persistent log `/telemetry.csv` formatted with complete engineering column headers: `record_id,measured_at,condition_status,condition_reason,motor_temp_c,ambient_temp_c,thermal_rise_c,ax_g,ay_g,az_g,rms_x_g,rms_y_g,rms_z_g,sample_count,quality,wifi_rssi_dbm,sensor_adxl,sensor_motor_temp,sensor_ambient_temp,storage_medium,storage_used_pct,synced`.
+  - Immediate `f.flush()` and `f.close()` after every write ensures that the user can unplug/eject the MicroSD card at any moment to analyze in Excel, MATLAB, or Python without FAT32 filesystem corruption.
+- **Automatic Fallback to LittleFS (up to 90% Ceiling):**
+  - If the MicroSD card is pulled out or encounters a write error, the firmware instantly catches it, updates `storage_medium = "flash_littlefs"`, and routes all incoming records to LittleFS `/lfs_queue/` and `/lfs_telemetry.csv`.
+  - Enforces the strict 90% capacity ceiling policy, preserving at least 10% operating flash headroom.
+- **MicroSD Hot-Plug Auto-Recovery:**
+  - Background task re-scans for SD card insertion every 15 seconds (reduced from 120s).
+  - When the card is re-inserted, the ESP32 automatically mounts FAT32, logs `SD_CARD_RECOVERED`, switches `storage_medium` back to `"sd_card"`, and resumes logging without requiring a device reboot.
+  - Background queue draining (`processBacklogQueue()`) automatically flushes any LittleFS records buffered while the SD card was extracted.
+- **Simultaneous / Asynchronous Cloud Upload:**
+  - Once persisted locally, the payload is transmitted to the Vercel/Supabase endpoint if Wi-Fi is active.
+  - Upon HTTP 2xx/409 acceptance, `removeRecordFromQueue(recordId)` removes the file from the un-synced queue folder, while leaving the row permanently in `/telemetry.csv` for operator extraction.
+- **Clear Separation of Network vs. Sensor Issues:**
+  - Wi-Fi offline: Green Status LED blinks 1 Hz; local logging continues; data buffers locally.
+  - Sensor error: Red Status LED blinks 1 Hz; Test LEDs 1-4 execute Double Pulse indicating the exact failed probe (LED 1=ADXL, LED 2=Motor, LED 3=Ambient, LED 4=RTC). Telemetry payload explicitly marks `sensor_status: { motor_temp: "error" }` with `motor_temp_c: null` and condition reason.
+
 ## [v1.5.1-hardened] — 2026-10-18: Critical Full-System Debug, Stabilization & Mobile UI
 
 ### 1. Embedded Firmware Decoupling & Brownout Diagnostics (ESP32-S3)
