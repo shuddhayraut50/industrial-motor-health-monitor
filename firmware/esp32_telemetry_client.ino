@@ -47,7 +47,7 @@ const char *DEVICE_INGEST_TOKEN = "YOUR_DEVICE_INGEST_TOKEN";
 #endif
 
 const char *DEVICE_ID = "motor-monitor-001";
-const char *FIRMWARE_VERSION = "1.6.0-quota-fastsync";
+const char *FIRMWARE_VERSION = "1.7.0-directpush-sdopt";
 
 // Timing & Cadence Constants
 constexpr uint32_t SAMPLE_INTERVAL_US = 5000;       // 5000 us = 5 ms -> 200 Hz
@@ -55,6 +55,7 @@ constexpr size_t FAST_WINDOW_SAMPLES = 50;           // 50 samples @ 200 Hz = 25
 constexpr uint32_t REPORT_INTERVAL_MS = 5000;        // 5-second telemetry upload cadence
 constexpr uint32_t TEMP_CONV_MS = 750;               // DS18B20 12-bit conversion time
 constexpr uint32_t REDISCOVERY_INTERVAL_MS = 15000;  // 15-second background probe re-scan
+constexpr uint32_t SD_RECOVERY_INTERVAL_MS = 120000; // 2-minute periodic SD card bus reset and recovery
 
 // Storage Quotas & Budget Allocation (Aligined with 90% Ceiling Policy)
 constexpr float TOTAL_STORAGE_CEILING_PCT = 90.0f;       // Strict 90% total storage ceiling
@@ -1045,7 +1046,7 @@ void scanOfflineQueue() {
     File dir = SD.open("/queue");
     if (dir && dir.isDirectory()) {
       File entry = dir.openNextFile();
-      while (entry) {
+      while (entry && count < 30) {
         if (!entry.isDirectory() && String(entry.name()).endsWith(".json")) {
           count++;
           if (oldest == "") oldest = String(entry.name());
@@ -1061,7 +1062,7 @@ void scanOfflineQueue() {
     File dir = LittleFS.open("/lfs_queue");
     if (dir && dir.isDirectory()) {
       File entry = dir.openNextFile();
-      while (entry) {
+      while (entry && count < 30) {
         if (!entry.isDirectory() && String(entry.name()).endsWith(".json")) {
           count++;
           if (oldest == "") oldest = String(entry.name());
@@ -1206,19 +1207,32 @@ bool initialiseSDCard(bool verbose = true) {
 
   bool mounted = false;
   uint32_t mountedSpeed = 0;
-  // Try 4 MHz (optimal), 10 MHz, 1 MHz, 400 kHz
-  const uint32_t trySpeeds[] = { 4000000, 10000000, 1000000, 400000 };
 
-  for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
-    uint32_t speed = trySpeeds[s];
-    // format_if_empty = true allows ESP32 FatFS to auto-format unformatted/raw/corrupted cards to FAT32
-    if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, true)) {
+  if (!verbose) {
+    // Fast periodic 2-minute recovery probe: test 4 MHz, then 1 MHz without auto-format
+    if (SD.begin(PIN_SD_CS, spiSD, 4000000, "/sd", 5, false)) {
       mounted = true;
-      mountedSpeed = speed;
-      break;
+      mountedSpeed = 4000000;
+    } else {
+      SD.end();
+      if (SD.begin(PIN_SD_CS, spiSD, 1000000, "/sd", 5, false)) {
+        mounted = true;
+        mountedSpeed = 1000000;
+      }
     }
-    SD.end();
-    delay(50);
+  } else {
+    // Initial boot scan across standard speeds (format_if_empty = false preserves existing data)
+    const uint32_t trySpeeds[] = { 4000000, 10000000, 1000000, 400000 };
+    for (size_t s = 0; s < sizeof(trySpeeds) / sizeof(trySpeeds[0]); s++) {
+      uint32_t speed = trySpeeds[s];
+      if (SD.begin(PIN_SD_CS, spiSD, speed, "/sd", 5, false)) {
+        mounted = true;
+        mountedSpeed = speed;
+        break;
+      }
+      SD.end();
+      delay(30);
+    }
   }
 
   if (!mounted) {
@@ -1418,6 +1432,56 @@ void removeRecordFromQueue(const String &recordId) {
   }
 }
 
+void migrateLittleFsQueueToSd() {
+  if (!sdCardReady || !littleFsReady) return;
+
+  File dir = LittleFS.open("/lfs_queue");
+  if (!dir || !dir.isDirectory()) return;
+
+  if (!SD.exists("/queue")) SD.mkdir("/queue");
+
+  int migratedCount = 0;
+  File entry = dir.openNextFile();
+  while (entry && migratedCount < 10) {
+    if (!entry.isDirectory() && String(entry.name()).endsWith(".json")) {
+      String fname = String(entry.name());
+      String lfsPath = String("/lfs_queue/") + fname;
+      String sdPath = String("/queue/") + fname;
+
+      static char s_migBuf[3072];
+      size_t bytesRead = entry.read((uint8_t*)s_migBuf, sizeof(s_migBuf) - 1);
+      s_migBuf[bytesRead] = '\0';
+      entry.close();
+
+      if (bytesRead > 0) {
+        File sdFile = SD.open(sdPath.c_str(), FILE_WRITE);
+        if (sdFile) {
+          sdFile.write((const uint8_t*)s_migBuf, bytesRead);
+          sdFile.flush();
+          sdFile.close();
+          // Delete ONLY from ESP32 LittleFS flash! Preserved on main SD storage!
+          LittleFS.remove(lfsPath.c_str());
+          migratedCount++;
+        } else {
+          // SD write failed, stop migration for now
+          break;
+        }
+      } else {
+        LittleFS.remove(lfsPath.c_str());
+      }
+    } else {
+      entry.close();
+    }
+    entry = dir.openNextFile();
+  }
+  dir.close();
+
+  if (migratedCount > 0) {
+    Serial.printf("[STORAGE-MIGRATE] Migrated %d offline record(s) from ESP32 LittleFS to SD card (cleared from ESP32).\n", migratedCount);
+    scanOfflineQueue();
+  }
+}
+
 bool appendTelemetryToCsv(
     const String &recordId, const String &measuredAt,
     const char *condStatus, const char *condReason,
@@ -1592,12 +1656,14 @@ void checkSensorRecovery() {
   if (!adxlReady) initialiseADXL345(false);
   if (!rtcReady) initialiseDS3231(false);
   if (!motorProbeFound || !ambientProbeFound) discoverTemperatureProbes(false);
-  // Re-probe SD card every 15s if missing to support hot-plugging when card is re-inserted
-  if (!sdCardReady && (now - lastSdRetryMs >= 15000)) {
+  // Re-probe SD card every 2 minutes (120s) if missing/failed, without stalling real-time tasks
+  if (!sdCardReady && (now - lastSdRetryMs >= SD_RECOVERY_INTERVAL_MS)) {
     lastSdRetryMs = now;
+    Serial.println("[SD] Attempting 2-minute periodic SD card bus reset and recovery...");
     if (initialiseSDCard(false)) {
-      Serial.println("[SD-HOTPLUG] SUCCESS: MicroSD card detected and remounted on SPI bus!");
+      Serial.println("[SD-RECOVER] SUCCESS: MicroSD card detected and remounted on SPI bus!");
       scanOfflineQueue();
+      migrateLittleFsQueueToSd();
     }
   }
 }
@@ -2072,7 +2138,15 @@ void processBacklogQueue() {
 
   auto processEntry = [&](bool isSD, const char *dirPath, const char *quarPath) -> bool {
     File dir = isSD ? SD.open(dirPath) : LittleFS.open(dirPath);
-    if (!dir || !dir.isDirectory()) return false;
+    if (!dir || !dir.isDirectory()) {
+      if (isSD && sdCardReady) {
+        sdCardReady = false;
+        sdCardStatus = "io_error";
+        storageMedium = "flash_littlefs";
+        Serial.printf("[SD] I/O Error accessing %s. Falling back to LittleFS for 2 minutes.\n", dirPath);
+      }
+      return false;
+    }
 
     File entry = dir.openNextFile();
     if (!entry) {
@@ -2090,9 +2164,14 @@ void processBacklogQueue() {
     entry.close();
     dir.close();
 
-    if (content.length() == 0) {
-      if (isSD) SD.remove(path.c_str());
-      else LittleFS.remove(path.c_str());
+    if (content.length() == 0 || !content.startsWith("{")) {
+      Serial.printf("[QUEUE] Corrupt/unreadable file %s. Quarantining...\n", path.c_str());
+      bool removed = isSD ? SD.remove(path.c_str()) : LittleFS.remove(path.c_str());
+      if (!removed) {
+        String badPath = String(dirPath) + "/" + entryName + ".bad";
+        if (isSD) SD.rename(path.c_str(), badPath.c_str());
+        else LittleFS.rename(path.c_str(), badPath.c_str());
+      }
       if (unsyncedRecordsCount > 0) unsyncedRecordsCount--;
       return true;
     }
@@ -2307,44 +2386,21 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
   serializeJson(doc, payload);
 
   // --------------------------------------------------------------------------
-  // STEP 1: STORE FIRST LOCALLY (Persistent Master CSV Log & Durability Buffer)
+  // STEP 1: PUSH DIRECTLY TO DATABASE FIRST (Zero SD bottleneck when online!)
   // --------------------------------------------------------------------------
-  float thermalRise = (snap.hasMotorTemp && snap.hasAmbientTemp) ? (snap.motorTemp - snap.ambientTemp) : 0.0f;
-  appendTelemetryToCsv(
-      recordId, measuredAt, snap.conditionStatus, snap.conditionReason,
-      snap.hasMotorTemp, snap.motorTemp,
-      snap.hasAmbientTemp, snap.ambientTemp,
-      thermalRise,
-      snap.hasVibration, snap.meanX, snap.meanY, snap.meanZ,
-      snap.rmsX, snap.rmsY, snap.rmsZ,
-      snap.sampleCount, snap.acquisitionQuality,
-      wifiRssi,
-      adxlStat, motorStat, ambStat,
-      storageMedium, storageUsedPct,
-      false // Initially false, marked synced upon confirmed cloud ingestion
-  );
-
-  // Always write to offline queue file first to guarantee non-volatile durability
-  saveRecordToQueue(recordId, payload);
-
-  // --------------------------------------------------------------------------
-  // STEP 2: SIMULTANEOUS / ASYNCHRONOUS CLOUD UPLOAD (When Network Free)
-  // --------------------------------------------------------------------------
+  bool uploadedDirectly = false;
   if (g_wifiConnected) {
     String responseStr;
     int httpCode = sendTelemetryPayload(payload, responseStr);
     if (httpCode >= 200 && httpCode < 300) {
-      // Confirmed accepted & persisted in Supabase database!
-      // Safely remove the temporary queue record so it is not re-uploaded from backlog
-      removeRecordFromQueue(recordId);
+      uploadedDirectly = true;
+      consecutiveUploadFailures = 0;
+      lastSuccessfulUploadMs = millis();
       if (diagTracker.lastApiState != "healthy") {
         diagTracker.lastApiState = "healthy";
         logDiagnosticEvent("api", "API_UPLOAD_RECOVERED", "info", "failing", "healthy", "HTTPS telemetry upload successfully restored", nullptr, true);
       }
-      consecutiveUploadFailures = 0;
-      lastSuccessfulUploadMs = millis();
     } else {
-      // HTTP failure (4xx, 5xx, timeout): Record is ALREADY safely stored in queue!
       consecutiveUploadFailures++;
       if (consecutiveUploadFailures == 3 && diagTracker.lastApiState != "failing") {
         diagTracker.lastApiState = "failing";
@@ -2352,13 +2408,42 @@ void handleTelemetrySnapshot(const TelemetrySnapshot &snap) {
         snprintf(errBuf, sizeof(errBuf), "{\"http_code\":%d,\"consecutive_failures\":%u}", httpCode, consecutiveUploadFailures);
         logDiagnosticEvent("api", "API_UPLOAD_FAILED", "error", "healthy", "failing", "HTTPS telemetry upload failed repeatedly", errBuf, false);
       }
-      // processBacklogQueue() will automatically drain and retry when network/server is free
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // STEP 2: MASTER AUDIT LOG (Continuous CSV Log on SD Card if healthy)
+  // --------------------------------------------------------------------------
+  float thermalRise = (snap.hasMotorTemp && snap.hasAmbientTemp) ? (snap.motorTemp - snap.ambientTemp) : 0.0f;
+  if (sdCardReady) {
+    appendTelemetryToCsv(
+        recordId, measuredAt, snap.conditionStatus, snap.conditionReason,
+        snap.hasMotorTemp, snap.motorTemp,
+        snap.hasAmbientTemp, snap.ambientTemp,
+        thermalRise,
+        snap.hasVibration, snap.meanX, snap.meanY, snap.meanZ,
+        snap.rmsX, snap.rmsY, snap.rmsZ,
+        snap.sampleCount, snap.acquisitionQuality,
+        wifiRssi,
+        adxlStat, motorStat, ambStat,
+        storageMedium, storageUsedPct,
+        uploadedDirectly // true = confirmed synced, false = pending offline sync
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // STEP 3: IF OFFLINE OR UPLOAD FAILED -> BUFFER OFFLINE
+  // Priority: SD Card (main storage) -> LittleFS (ESP32 flash fallback) with FIFO
+  // --------------------------------------------------------------------------
+  if (!uploadedDirectly) {
+    bool saved = saveRecordToQueue(recordId, payload);
+    Serial.printf("[OFFLINE-BUFFER] Record %s stored in %s queue (Total unsynced: %u, saved: %s)\n",
+                  recordId.c_str(), storageMedium.c_str(), unsyncedRecordsCount, saved ? "YES" : "NO");
   } else {
-    // Wi-Fi is currently disconnected / offline:
-    // Data is 100% safe in /queue/ or /lfs_queue/. It will drain automatically when Wi-Fi connects.
-    Serial.printf("[STORE-FIRST] Wi-Fi offline. Record %s safely stored in %s queue (Total unsynced: %u)\n",
-                  recordId.c_str(), storageMedium.c_str(), unsyncedRecordsCount);
+    // Online and push succeeded: If LittleFS has buffered records and SD is ready, migrate to SD!
+    if (sdCardReady && littleFsReady) {
+      migrateLittleFsQueueToSd();
+    }
   }
 }
 
@@ -2414,9 +2499,11 @@ void setup() {
     }
   }
 
+  Serial.println("[STORAGE] Storage hierarchy initialized. Discovering temperature probes...");
   // 5. Initialise OneWire Temperature Probes
   discoverTemperatureProbes(true);
 
+  Serial.println("[DSP] Launching Core 0 Real-Time Vibration Engine (200 Hz)...");
   // 6. Launch Real-Time Hardware Task on Core 0 (Priority 5)
   // Real-time vibration sampling & condition evaluation starts IMMEDIATELY!
   xTaskCreatePinnedToCore(
@@ -2429,6 +2516,7 @@ void setup() {
       0  // Dedicated to Core 0 (isolated from Wi-Fi stack)
   );
 
+  Serial.println("[NETWORK] Starting non-blocking Wi-Fi association...");
   // 7. Start Asynchronous Wi-Fi Connection in Background (Non-Blocking)
   startWiFiConnection();
 
@@ -2459,6 +2547,13 @@ void loop() {
   checkSensorRecovery();
   processBacklogQueue();
   processEventsQueue();
+
+  // Periodic background LittleFS -> SD migration when SD is healthy
+  static uint32_t lastMigrateCheckMs = 0;
+  if (sdCardReady && littleFsReady && (millis() - lastMigrateCheckMs >= 15000)) {
+    lastMigrateCheckMs = millis();
+    migrateLittleFsQueueToSd();
+  }
 
   // Asynchronous Command ACK Dispatcher on Core 1 (Insulates Core 0)
   if (g_pendingCmdAck.pending && g_wifiConnected) {
